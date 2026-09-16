@@ -4,6 +4,10 @@ import argparse
 from pathlib import Path
 import subprocess
 import sys
+try:
+    from scripts.console_ui import section, note, option
+except ModuleNotFoundError:
+    from console_ui import section, note, option
 
 ROOT = Path(__file__).resolve().parent.parent
 ALLOWED = {
@@ -42,32 +46,43 @@ def main():
     parser.add_argument("message", nargs="?", help="optional commit message")
     args = parser.parse_args()
     validate()
-    print("\nGitHub destination: prab-s/powerterm — branch main", flush=True)
-    print("Files to review (?? = new, M = modified, D = deleted):", flush=True)
+    section("GitHub | Review changes")
+    note("Repository: prab-s/powerterm")
+    note("Branch: main   |   Remote: origin")
+    section("Files to review")
+    note("Status key: ?? = new, M = modified, D = deleted")
+    print(flush=True)
     git("status", "--short", "--branch", "--untracked-files=all")
     # Refresh only the expected branch; reject divergence before changing the index.
     git("fetch", "--no-tags", "origin", "refs/heads/main")
     if subprocess.run(["git", "merge-base", "--is-ancestor", "FETCH_HEAD", "HEAD"], cwd=ROOT).returncode:
         raise RuntimeError("Local main is behind or diverged from origin/main. Reconcile it manually first.")
     dirty = bool(git("status", "--porcelain", "--untracked-files=all", capture=True))
-    print("\nExisting commits waiting to be pushed:", flush=True)
-    git("log", "--oneline", "FETCH_HEAD..HEAD")
+    section("Existing commits waiting to be pushed")
+    outgoing = git("log", "--oneline", "FETCH_HEAD..HEAD", capture=True).strip()
+    print(outgoing, flush=True) if outgoing else note("No existing commits waiting to be pushed.")
     message = args.message
+    section("Commit and push summary")
     if dirty and not message:
         message = input("Commit message [Update PowerTerm]: ").strip() or "Update PowerTerm"
     if dirty and not message.strip():
         raise RuntimeError("Commit message must not be blank.")
     if dirty:
-        print(f"\nCommit message: {message}")
-        print("Continuing will stage ALL non-ignored changes shown above, commit, and push to origin main.")
+        note(f"Commit message: {message}")
+        print()
+        note("Continuing will stage ALL non-ignored changes shown above, commit, and push to origin main.")
     else:
         print("\nNo file changes; no new commit will be created.")
     while True:
-        print("\n  1. Confirm and push to GitHub\n  2. Review tracked-file diff\n  0. Cancel")
-        choice = input("Choose [0]: ").strip().lower()
+        section("Confirm GitHub action")
+        option("1", "Confirm and push to GitHub")
+        option("2", "Review tracked-file diff")
+        option("0", "Cancel")
+        choice = input("  Your choice [0]: ").strip().lower()
         if choice in ("1", "y", "yes"):
             break
         if choice == "2":
+            section("Tracked-file diff")
             git("--no-pager", "diff", "HEAD", "--", ".")
             print("New untracked files are listed in status above; review their contents before pushing.")
             continue
@@ -75,6 +90,7 @@ def main():
             print("Cancelled; nothing staged, committed, or pushed.")
             return 2
         print("Choose 1 to push, 2 to review, or 0 to cancel.")
+    section("Committing and pushing")
     validate()
     if dirty:
         git("add", "--all", "--", ".")
@@ -90,12 +106,14 @@ def main():
     validate()
     git("-c", "remote.origin.mirror=false", "push", "--no-force", "--no-follow-tags",
         "--recurse-submodules=no", "origin", "refs/heads/main:refs/heads/main")
-    print("GitHub push completed: origin main.")
+    section("GitHub push complete")
+    note("Destination: origin main")
 
 
 if __name__ == "__main__":
     try:
         sys.exit(main())
     except (RuntimeError, OSError, subprocess.CalledProcessError, EOFError, KeyboardInterrupt) as exc:
+        section("Push stopped", stream=sys.stderr)
         print(f"Push stopped: {exc}", file=sys.stderr)
         sys.exit(1)

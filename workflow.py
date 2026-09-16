@@ -6,6 +6,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
+from scripts.console_ui import section, note, option
 
 ROOT = Path(__file__).resolve().parent
 
@@ -57,11 +58,18 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if not shutil.which("git"):
         raise RuntimeError("Git is required; install it before running this workflow.")
-    print("1/4 Installing/checking Python requirements in .venv", flush=True)
+    section("POWERTERM | Project workflow")
+    note("Dependencies  >  Tests  >  GitHub  >  Builds")
+    section("STEP 1 OF 4 | Python requirements")
+    note("Installing/checking dependencies in the project's .venv.")
     python = prepare_environment()
-    print("2/4 Running tests (failure stops the workflow)", flush=True)
+    section("STEP 2 OF 4 | Tests")
+    note("All tests must pass before continuing.")
     run(python, ROOT / "scripts/test.py")
-    print("\n3/4 GitHub\n  1. Review changes and push\n  2. Skip GitHub and choose builds\n  0. Finish now", flush=True)
+    section("STEP 3 OF 4 | GitHub")
+    option("1", "Review changes and push", "You will review the commit and confirm before pushing.")
+    option("2", "Skip GitHub and choose builds", "Build from the files currently in this folder.")
+    option("0", "Finish now")
     while True:
         choice = input("Choose [1]: ").strip() or "1"
         if choice in ("0", "1", "2"):
@@ -77,17 +85,19 @@ def main(argv=None):
         run(*push_args)
     else:
         print("GitHub push skipped. Builds will use the files currently in this folder.")
-    print("\n4/4 Choose builds or a Windows transfer ZIP", flush=True)
+    section("STEP 4 OF 4 | Builds and Windows transfer ZIP")
     run(python, ROOT / "scripts/build.py")
-    print("Workflow completed.")
+    section("Workflow complete")
 
 
 if __name__ == "__main__":
     try:
         main()
     except subprocess.CalledProcessError as exc:
+        section("Workflow stopped", stream=sys.stderr)
         print(f"Workflow stopped: command exited with status {exc.returncode}. Later steps were not run.", file=sys.stderr)
         sys.exit(exc.returncode if exc.returncode > 0 else 1)
     except (RuntimeError, OSError, EOFError, KeyboardInterrupt) as exc:
+        section("Workflow stopped", stream=sys.stderr)
         print(f"Workflow stopped: {exc}", file=sys.stderr)
         sys.exit(1)

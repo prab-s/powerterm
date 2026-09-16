@@ -7,7 +7,7 @@ if not "%build_result%"=="0" (
     echo Build failed. Read the error above, correct it, and run this file again.
 ) else (
     echo.
-    echo Ready: "%~dp0dist\PowerTerm.exe"
+    echo Ready: see the output files in "%~dp0dist"
 )
 pause
 exit /b %build_result%

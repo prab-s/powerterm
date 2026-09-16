@@ -133,12 +133,12 @@ class BuildEnvironmentTests(unittest.TestCase):
         available["flatpak"] = "missing SDK"
         self.assertEqual(build.parse_selection("1, 2,5,1", available), ["windows", "linux", "deb"])
         self.assertEqual(build.parse_selection("windows deb", available), ["windows", "deb"])
-        self.assertEqual(build.parse_selection("all", available), ["windows", "linux", "appimage", "deb"])
+        self.assertEqual(build.parse_selection("all", available), ["windows", "linux", "appimage", "deb", "msi"])
         self.assertEqual(build.parse_selection("", available), [])
         with self.assertRaisesRegex(ValueError, "missing SDK"):
             build.parse_selection("1,4", available)
         with self.assertRaisesRegex(ValueError, "Unknown"):
-            build.parse_selection("6", available)
+            build.parse_selection("7", available)
 
     def test_menu_retries_invalid_selection_and_confirms(self):
         build = load("build")
@@ -158,7 +158,8 @@ class BuildEnvironmentTests(unittest.TestCase):
                 names = {name.removeprefix(prefix) for name in archive.namelist()}
                 self.assertEqual(names, {"main.py", "powerterm.svg", "LICENSE", "requirements.txt",
                     "requirements-build.txt", "scripts/build.py", "scripts/windows_setup.py",
-                    "scripts/build-windows.bat", "BUILD-WINDOWS.bat", "START-HERE.txt", "PACKAGE-VERSION.txt"})
+                    "scripts/build-windows.bat", "scripts/console_ui.py", "scripts/windows_msi.py", "WINDOWS-MSI.md",
+                    "BUILD-WINDOWS.bat", "START-HERE.txt", "PACKAGE-VERSION.txt", "PACKAGE-TARGET.txt"})
                 self.assertEqual(archive.read(prefix + "LICENSE"), (SCRIPTS.parent / "LICENSE").read_bytes())
                 self.assertEqual(archive.read(prefix + "PACKAGE-VERSION.txt"), b"1.2.3\n")
 
@@ -212,3 +213,71 @@ class CombinedWorkflowTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "missing dependency"):
                 self.workflow.main([])
             run.assert_not_called()
+
+
+class WindowsInstallerTests(unittest.TestCase):
+    def test_versions_use_only_msi_comparable_fields(self):
+        msi = load("windows_msi")
+        for version in ("0.1.0", "1.2.3", "255.255.65535"):
+            msi.validate_version(version)
+        for version in ("1.0", "1.2.3.4", "1.2.3beta", "256.0.0", "0.0.65536", "01.2.3"):
+            with self.assertRaises(ValueError):
+                msi.validate_version(version)
+
+    def test_upgrade_identity_and_components_stay_stable_without_owning_config(self):
+        import xml.etree.ElementTree as ET
+        msi = load("windows_msi")
+        ns = {"w": msi.NS}
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            bundle = root / "bundle"
+            (bundle / "_internal").mkdir(parents=True)
+            (bundle / "PowerTerm.exe").write_bytes(b"fixture")
+            (bundle / "_internal/library.dll").write_bytes(b"library")
+            trees = []
+            for version in ("0.1.0", "0.1.1"):
+                source = msi.author_installer(bundle, root, version, "x64", SCRIPTS.parent / "LICENSE")
+                trees.append(ET.parse(source))
+            for tree in trees:
+                package = tree.find("w:Package", ns)
+                self.assertEqual(package.get("UpgradeCode"), msi.UPGRADE_CODE)
+                self.assertIsNone(package.get("ProductCode"))  # WiX generates a new one.
+                self.assertEqual(package.get("Scope"), "perMachine")
+                upgrade = package.find("w:MajorUpgrade", ns)
+                self.assertEqual(upgrade.get("Schedule"), "afterInstallInitialize")
+                self.assertEqual(upgrade.get("AllowSameVersionUpgrades"), "yes")
+                self.assertIsNotNone(upgrade.get("DowngradeErrorMessage"))
+                self.assertIsNotNone(tree.find(".//w:Shortcut", ns))
+                self.assertIsNone(tree.find(".//w:RemoveFile", ns))
+                self.assertIsNone(tree.find(".//w:RegistryValue", ns))
+                self.assertEqual(len(tree.findall(".//w:File", ns)), 2)
+            components = lambda tree: [(c.get("Id"), c.get("Guid")) for c in tree.findall(".//w:Component", ns)]
+            self.assertEqual(components(trees[0]), components(trees[1]))
+            (bundle / "config.json").write_text('{}')
+            with self.assertRaisesRegex(ValueError, "configuration"):
+                msi.author_installer(bundle, root, "0.1.2", "x64", SCRIPTS.parent / "LICENSE")
+
+    def test_msi_uses_directory_bundle_and_portable_keeps_single_file(self):
+        build = load("build")
+        with tempfile.TemporaryDirectory() as folder:
+            work = Path(folder)
+            with patch.object(build.platform, "system", return_value="Windows"), \
+                    patch.object(build, "freeze", return_value=work / "bundle") as freeze, \
+                    patch.object(build.windows_msi, "build_msi", return_value=work / "app.msi"):
+                build.package("msi", work, "0.1.0", "25.08", {})
+                self.assertFalse(freeze.call_args.args[1])
+                build.package("windows", work, "0.1.0", "25.08", {})
+                self.assertTrue(freeze.call_args.args[1])
+            with patch.object(build.platform, "system", return_value="Windows"), patch.object(build, "run"):
+                self.assertEqual(build.freeze(work, True).name, "PowerTerm-Portable.exe")
+                self.assertEqual(build.freeze(work, False).name, "PowerTerm")
+
+    def test_linux_msi_kit_selects_msi_on_windows(self):
+        build = load("build")
+        with tempfile.TemporaryDirectory() as folder, patch.object(build.platform, "system", return_value="Linux"):
+            result = build.package("msi", Path(folder), "0.1.1", "25.08", {})
+            with zipfile.ZipFile(result) as archive:
+                prefix = "PowerTerm-0.1.1-windows-msi-build-kit/"
+                self.assertEqual(archive.read(prefix + "PACKAGE-TARGET.txt"), b"msi\n")
+                self.assertIn(prefix + "scripts/windows_msi.py", archive.namelist())
+                self.assertIn(prefix + "WINDOWS-MSI.md", archive.namelist())

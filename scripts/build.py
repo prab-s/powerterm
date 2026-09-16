@@ -11,11 +11,17 @@ import subprocess
 import sys
 import tempfile
 import zipfile
+try:
+    from scripts.console_ui import section, note, option, rule
+    from scripts import windows_msi
+except ModuleNotFoundError:
+    from console_ui import section, note, option, rule
+    import windows_msi
 
 ROOT = Path(__file__).resolve().parent.parent
 DIST = ROOT / "dist"
 APP_ID = "io.github.prab_s.PowerTerm"
-TARGETS = ("windows", "linux", "appimage", "flatpak", "deb")
+TARGETS = ("windows", "linux", "appimage", "flatpak", "deb", "msi")
 MODULES = ("PyInstaller", "PySide6", "paramiko", "psutil", "pyte", "keyring")
 
 
@@ -38,9 +44,9 @@ def desktop(icon="powerterm"):
 
 
 def availability(target, branch):
-    if target == "windows" and platform.system() != "Windows":
+    if target in ("windows", "msi") and platform.system() != "Windows":
         return None  # Source kit only; the executable will be built on Windows.
-    required_os = "Windows" if target == "windows" else "Linux"
+    required_os = "Windows" if target in ("windows", "msi") else "Linux"
     if platform.system() != required_os:
         return f"requires a native {required_os} environment"
     needed = {"appimage": ("appimagetool",), "deb": ("dpkg-deb", "dpkg"),
@@ -55,16 +61,17 @@ def availability(target, branch):
             if result.returncode:
                 return f"missing {runtime}//{branch}; install the SDK and Platform first"
     else:
-        modules = MODULES + (("winpty",) if target == "windows" else ())
+        modules = MODULES + (("winpty",) if target in ("windows", "msi") else ())
         missing = [name for name in modules if importlib.util.find_spec(name) is None]
         if missing:
             return "missing Python modules: " + ", ".join(missing) + "; install requirements-build.txt"
-    return None
+    return windows_msi.tool_problem() if target == "msi" else None
 
 
 def target_label(target):
     return {
-        "windows": "Windows — build PowerTerm.exe" if platform.system() == "Windows" else "Windows — create a ZIP to build on your Windows computer",
+        "windows": "Windows Portable — single-file executable" if platform.system() == "Windows" else "Windows Portable — create a build ZIP for Windows",
+        "msi": "Windows MSI — installer with upgrades" if platform.system() == "Windows" else "Windows MSI — create an installer build ZIP for Windows",
         "linux": "Linux — standalone executable",
         "appimage": "Linux — AppImage",
         "flatpak": "Linux — Flatpak (experimental)",
@@ -83,9 +90,9 @@ def parse_selection(value, available):
         return selected
     selected = []
     for token in tokens:
-        target = TARGETS[int(token) - 1] if token in ("1", "2", "3", "4", "5") else token
+        target = TARGETS[int(token) - 1] if token.isdigit() and 1 <= int(token) <= len(TARGETS) else token
         if target not in TARGETS:
-            raise ValueError(f"Unknown choice: {token}. Use numbers 1–5 or target names.")
+            raise ValueError(f"Unknown choice: {token}. Use numbers 1–{len(TARGETS)} or target names.")
         if available[target]:
             raise ValueError(f"Cannot select {target}: {available[target]}")
         if target not in selected:
@@ -94,46 +101,55 @@ def parse_selection(value, available):
 
 
 def choose_targets(available):
-    print("\nWhat would you like to create?")
+    section("Build selection | What would you like to create?")
     for number, target in enumerate(TARGETS, 1):
-        print(f"  {number}. {target_label(target)}")
-        print(f"     {'Unavailable: ' + available[target] if available[target] else 'Ready'}")
-    print("  A. All available choices\n  0. Finish without building")
+        option(number, target_label(target), "UNAVAILABLE: " + available[target] if available[target] else "READY")
+    rule()
+    option("A", "All available choices")
+    option("0", "Finish without building")
+    note("Choose one or more numbers, separated by commas. Example: 1,2,5")
+    print()
     while True:
         try:
-            selected = parse_selection(input("Choose numbers separated by commas (example: 1,2,5) [0]: "), available)
+            selected = parse_selection(input("  Your selection [0]: "), available)
         except ValueError as exc:
             print(exc)
             continue
         if not selected:
             return []
-        print("\nSelected:")
+        section("Review build selection")
         for target in selected:
-            print(f"  - {target_label(target)}")
-        if input("Create these now? [y/N]: ").strip().lower() in ("y", "yes"):
+            note(f"- {target_label(target)}")
+        print()
+        if input("  Create these now? [y/N]: ").strip().lower() in ("y", "yes"):
             return selected
         print("Nothing started. Choose again, or enter 0 to finish.")
 
 
-def windows_kit(work, version):
-    output = work / f"PowerTerm-{version}-windows-build-kit.zip"
-    folder = f"PowerTerm-{version}-windows-build-kit"
+def windows_kit(work, version, target="windows"):
+    folder = f"PowerTerm-{version}-{'windows' if target == 'windows' else 'windows-msi'}-build-kit"
+    output = work / (folder + ".zip")
     # Explicit allowlist excludes Git history, credentials, caches and host binaries.
     files = ("main.py", "powerterm.svg", "LICENSE", "requirements.txt",
              "requirements-build.txt", "scripts/build.py", "scripts/windows_setup.py",
-             "scripts/build-windows.bat")
+             "scripts/build-windows.bat", "scripts/console_ui.py", "scripts/windows_msi.py")
     with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         for name in files:
             archive.write(ROOT / name, f"{folder}/{name}")
         archive.write(ROOT / "scripts/windows-kit.bat", f"{folder}/BUILD-WINDOWS.bat")
         archive.writestr(f"{folder}/PACKAGE-VERSION.txt", version + "\n")
+        archive.writestr(f"{folder}/PACKAGE-TARGET.txt", target + "\n")
+        archive.write(ROOT / "scripts/WINDOWS-MSI.md", f"{folder}/WINDOWS-MSI.md")
         archive.writestr(f"{folder}/START-HERE.txt", """PowerTerm Windows build kit
 
 1. Install Python 3.11 or newer for Windows, including pip and the Python launcher.
 2. Extract the ENTIRE ZIP to a writable folder (do not run inside the ZIP).
 3. Double-click BUILD-WINDOWS.bat.
 4. Wait for dependency installation and the PyInstaller build to finish.
-5. Your standalone application is dist\\PowerTerm.exe.
+5. Output is in dist: PowerTerm-Portable.exe or PowerTerm-VERSION-ARCH.msi.
+
+For the MSI kit, first follow WINDOWS-MSI.md to install WiX and its UI extension.
+The MSI installs a directory build; the portable EXE remains a single-file build.
 
 Internet access is needed for Python dependencies. Python's architecture determines
 the executable's architecture. No Git installation or repository is needed.
@@ -150,6 +166,8 @@ source available when distributing the executable.
 
 def freeze(work, onefile):
     name = "PowerTerm" if platform.system() == "Windows" else "powerterm"
+    if platform.system() == "Windows" and onefile:
+        name = "PowerTerm-Portable"
     mode = "onefile" if onefile else "onedir"
     out = work / mode
     args = [sys.executable, "-m", "PyInstaller", "--noconfirm", "--clean",
@@ -206,14 +224,16 @@ python3 -m PyInstaller --noconfirm --clean --onedir --name powerterm \\
 
 
 def package(target, work, version, branch, frozen):
-    if target == "windows" and platform.system() != "Windows":
-        return windows_kit(work, version)
+    if target in ("windows", "msi") and platform.system() != "Windows":
+        return windows_kit(work, version, target)
     if target == "flatpak":
         return build_flatpak(work, version, branch)
     onefile = target in ("linux", "windows")
     if onefile not in frozen:
         frozen[onefile] = freeze(work, onefile)
     binary = frozen[onefile]
+    if target == "msi":
+        return windows_msi.build_msi(binary, work, version, ROOT / "LICENSE")
     if onefile:
         return binary
     if target == "appimage":
@@ -267,8 +287,9 @@ def main():
             parser.error(f"missing required project file: {name}")
     available = {t: availability(t, args.flatpak_branch) for t in TARGETS}
     if args.targets:
+        section("Build availability")
         for target, reason in available.items():
-            print(f"{target_label(target)}: {reason or 'ready'}")
+            option(target, target_label(target), "UNAVAILABLE: " + reason if reason else "READY")
         try:
             selected = parse_selection(" ".join(args.targets), available)
         except ValueError as exc:
@@ -278,27 +299,45 @@ def main():
     if not selected:
         print("Finished without building.")
         return 0
+    if "msi" in selected:
+        try:
+            windows_msi.validate_version(args.version)
+        except ValueError as exc:
+            parser.error(str(exc))
     if "flatpak" in selected:
         print("Flatpak is experimental: local shells/system information run inside its sandbox. Build downloads Python dependencies inside the SDK.")
     DIST.mkdir(exist_ok=True)
     build_root = ROOT / "build"
     build_root.mkdir(exist_ok=True)
     failed = False
+    results = []
     with tempfile.TemporaryDirectory(prefix="packaging-", dir=build_root) as temp:
         work = Path(temp)
         frozen = {}
-        for selected_target in selected:
+        for index, selected_target in enumerate(selected, 1):
+            section(f"BUILD {index} OF {len(selected)} | {target_label(selected_target)}")
             try:
                 output = package(selected_target, work, args.version, args.flatpak_branch, frozen)
                 destination = DIST / output.name
                 shutil.copy2(output, destination)
                 shutil.copy2(ROOT / "LICENSE", DIST / "LICENSE")
-                print(f"BUILT {selected_target}: {destination}", flush=True)
-                if destination.suffix == ".zip":
-                    print("Copy this ZIP to Windows, extract it, and double-click BUILD-WINDOWS.bat. Instructions are in START-HERE.txt.", flush=True)
-            except (OSError, subprocess.CalledProcessError) as exc:
+                results.append((selected_target, destination, None))
+                note(f"OK: {destination.name}")
+            except (OSError, subprocess.CalledProcessError, ValueError) as exc:
                 failed = True
+                results.append((selected_target, None, str(exc)))
                 print(f"FAILED {selected_target}: {exc}", file=sys.stderr)
+    section("Build results")
+    for target, destination, error in results:
+        if error:
+            option("FAILED", target_label(target), error)
+        else:
+            option("OK", target_label(target))
+            print(f"  File: {destination}\n", flush=True)
+            if destination.suffix == ".zip":
+                note("Next: copy the ZIP to Windows, extract it, and double-click BUILD-WINDOWS.bat. See START-HERE.txt for instructions.")
+                print()
+    rule()
     return int(failed)
 
 
@@ -306,5 +345,6 @@ if __name__ == "__main__":
     try:
         sys.exit(main())
     except (EOFError, KeyboardInterrupt, OSError) as exc:
+        section("Build stopped", stream=sys.stderr)
         print(f"Build stopped: {exc}", file=sys.stderr)
         sys.exit(1)

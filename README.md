@@ -377,6 +377,9 @@ python3 workflow.py "Describe the change"
 ```
 
 On Windows use `python workflow.py`. No virtual-environment activation is needed.
+The console uses horizontal separators, numbered stages, spaced menu options,
+and a final build-results section with output paths. Formatting is plain text so
+it remains readable in terminal sessions and saved logs.
 The workflow creates or reuses the project's `.venv`, installs missing Python
 application and build dependencies from `requirements-build.txt`, checks dependency
 consistency and library imports, runs the separate test script, then offers GitHub
@@ -462,7 +465,7 @@ This creates `dist/PowerTerm-0.1.0-windows-build-kit.zip`. Copy/download it to
 Windows, extract the entire ZIP, then double-click **BUILD-WINDOWS.bat**. Install
 Python 3.11+ with pip and the Python launcher on Windows first; internet access is
 needed for dependencies. The launcher creates a Windows virtual environment,
-installs the requirements and builds `dist/PowerTerm.exe`. It pauses on completion
+installs the requirements and builds `dist/PowerTerm-Portable.exe`. It pauses on completion
 or failure so the output remains visible. `START-HERE.txt` contains instructions.
 
 The ZIP includes application source, icon, original licence, requirements and the
@@ -480,11 +483,12 @@ scripts\build-windows.bat windows
 `python scripts/build.py` also works directly on either OS. Without targets, the
 numbered menu shows each option and its availability:
 
-1. Windows executable (on Windows) or Windows build ZIP (on Linux)
+1. Windows Portable executable (on Windows) or portable build ZIP (on Linux)
 2. Linux standalone executable
 3. Linux AppImage
 4. Linux Flatpak
 5. Debian/Ubuntu package
+6. Windows MSI installer (on Windows) or MSI build ZIP (on Linux)
 
 Enter one number, several separated by commas (for example `1,2,5`), or `A` for
 all available choices. Review the selection and answer `y` to start. Enter `0`
@@ -499,7 +503,7 @@ python scripts/build.py 1,2,5 --version 0.1.0
 ```
 
 `all` creates every output whose prerequisites are available, including the
-Windows transfer ZIP on Linux. It
+Windows Portable and MSI transfer ZIPs on Linux. It
 prints unavailable targets, continues after individual failures, and returns
 nonzero if a selected build fails or no targets are available. Supplying an
 unavailable target directly fails. Scripts do not install host tools, download
@@ -508,7 +512,9 @@ SDKs, install packages into the system, or publish artifacts.
 | Target | Output in `dist/` | Requirements |
 | --- | --- | --- |
 | `windows` on Linux | `PowerTerm-VERSION-windows-build-kit.zip` | Python and the project files |
-| `windows` on Windows | `PowerTerm.exe` | Windows, application dependencies and PyInstaller (installed by the Windows launcher) |
+| `windows` on Windows | `PowerTerm-Portable.exe` | Windows, application dependencies and PyInstaller (installed by the Windows launcher) |
+| `msi` on Linux | `PowerTerm-VERSION-windows-msi-build-kit.zip` | Python and the project files |
+| `msi` on Windows | `PowerTerm-VERSION-ARCH.msi` | Windows, Python build dependencies, WiX 4.0.6 and matching UI extension |
 | `linux` | `powerterm` | Linux, application dependencies and PyInstaller |
 | `appimage` | `PowerTerm-VERSION-ARCH.AppImage` | Linux, Python build dependencies and `appimagetool` on PATH |
 | `deb` | `powerterm_VERSION_ARCH.deb` | Linux, Python build dependencies, `dpkg` and `dpkg-deb` |
@@ -517,10 +523,11 @@ SDKs, install packages into the system, or publish artifacts.
 The default package version is `0.1.0`; pass `--version` for releases. This is
 packaging metadata, not a change to the app. Temporary build files go under
 `build/`; successful artifacts replace matching filenames in `dist/`. Old
-artifacts from previous runs remain, so check the `BUILT`/`FAILED` output.
+artifacts from previous runs remain, so check the `OK`/`FAILED` build results.
 
 PyInstaller bundles Python, app dependencies, the SVG icon and unchanged GPL
-licence. Windows uses one-file GUI mode and includes the Windows PTY backend.
+licence. Windows Portable uses one-file GUI mode; the MSI uses a directory build.
+Both include the Windows PTY backend.
 Linux executable mode uses one file; AppImage and Debian wrap a one-directory
 bundle. Running the finished executable needs no Python installation; building
 the Windows kit does require Python. Native
@@ -536,6 +543,41 @@ qualified against every Debian/Ubuntu release. AppImage creation follows the
 may require FUSE or an extracted tool installation on restricted servers.
 Smoke-test each artifact on its destination desktop, including local terminals,
 SSH, file access, icon display and credential storage, before distribution.
+
+### Windows MSI installation and upgrades
+
+Choose menu option `6` or prepare an MSI build kit on Linux with:
+
+```bash
+python3 scripts/build.py msi --version 0.1.1
+```
+
+Extract the resulting ZIP on Windows and follow `WINDOWS-MSI.md` to install WiX
+and its UI extension, then run `BUILD-WINDOWS.bat`. The MSI kit selects the MSI
+target automatically. The full [Windows MSI guide](scripts/WINDOWS-MSI.md) also
+covers building both Portable and MSI outputs in one command.
+
+The MSI installs unpacked application files into Program Files with a Start menu
+shortcut and an Installed Apps entry. This avoids the portable executable's
+extraction step at launch; the total installed size is not necessarily smaller.
+It requires administrator approval to install, but users run PowerTerm normally.
+
+Increment the three-part version for every release. A newer MSI replaces the
+previous MSI installation; older versions are blocked. Same-version rebuilds
+replace the existing installation rather than creating a duplicate entry. This
+uses a stable product-family UpgradeCode and transactional removal of the old
+payload, as described in [WiX's major-upgrade documentation](https://docs.firegiant.com/wix/schema/wxs/majorupgrade/).
+
+Close PowerTerm before upgrading. The installer does not own `config.json` or
+`hosts.json` and never deletes the per-user configuration directory, including
+during uninstall. The app's Qt application/organization names remain unchanged,
+so the existing configuration is reused for the same Windows user. Passwords stay
+in the OS credential store. Existing portable EXEs are not removed by the MSI.
+
+The MSI build and actual install/upgrade/uninstall sequence must be validated on
+Windows before distributing a release. Linux checks cover the generated installer
+recipe and build-kit contents, not Windows Installer execution. The guide includes
+a test checklist for verifying configuration retention across upgrades.
 
 ### Experimental Flatpak
 
