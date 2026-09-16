@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import zipfile
 from unittest.mock import patch
 
 SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
@@ -117,7 +118,8 @@ class BuildEnvironmentTests(unittest.TestCase):
             for target in ("linux", "appimage", "flatpak", "deb"):
                 self.assertIn("native Linux", build.availability(target, "25.08"))
         with patch.object(build.platform, "system", return_value="Linux"):
-            self.assertIn("native Windows", build.availability("windows", "25.08"))
+            self.assertIsNone(build.availability("windows", "25.08"))
+            self.assertIn("ZIP", build.target_label("windows"))
 
     def test_missing_appimage_tool_is_reported(self):
         build = load("build")
@@ -125,12 +127,47 @@ class BuildEnvironmentTests(unittest.TestCase):
                 patch.object(build.shutil, "which", return_value=None):
             self.assertIn("appimagetool", build.availability("appimage", "25.08"))
 
+    def test_menu_accepts_multiple_numbers_and_rejects_unavailable_targets(self):
+        build = load("build")
+        available = dict.fromkeys(build.TARGETS)
+        available["flatpak"] = "missing SDK"
+        self.assertEqual(build.parse_selection("1, 2,5,1", available), ["windows", "linux", "deb"])
+        self.assertEqual(build.parse_selection("windows deb", available), ["windows", "deb"])
+        self.assertEqual(build.parse_selection("all", available), ["windows", "linux", "appimage", "deb"])
+        self.assertEqual(build.parse_selection("", available), [])
+        with self.assertRaisesRegex(ValueError, "missing SDK"):
+            build.parse_selection("1,4", available)
+        with self.assertRaisesRegex(ValueError, "Unknown"):
+            build.parse_selection("6", available)
+
+    def test_menu_retries_invalid_selection_and_confirms(self):
+        build = load("build")
+        with patch("builtins.input", side_effect=["oops", "1,2", "no", "1", "yes"]), \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(build.choose_targets(dict.fromkeys(build.TARGETS)), ["windows"])
+
+    def test_windows_zip_is_self_contained_source_kit_without_repository_data(self):
+        build = load("build")
+        with tempfile.TemporaryDirectory() as folder, \
+                patch.object(build.platform, "system", return_value="Linux"), \
+                patch.object(build, "freeze", side_effect=AssertionError("must not cross-compile")):
+            output = build.package("windows", Path(folder), "1.2.3", "25.08", {})
+            with zipfile.ZipFile(output) as archive:
+                self.assertIsNone(archive.testzip())
+                prefix = "PowerTerm-1.2.3-windows-build-kit/"
+                names = {name.removeprefix(prefix) for name in archive.namelist()}
+                self.assertEqual(names, {"main.py", "powerterm.svg", "LICENSE", "requirements.txt",
+                    "requirements-build.txt", "scripts/build.py", "scripts/windows_setup.py",
+                    "scripts/build-windows.bat", "BUILD-WINDOWS.bat", "START-HERE.txt", "PACKAGE-VERSION.txt"})
+                self.assertEqual(archive.read(prefix + "LICENSE"), (SCRIPTS.parent / "LICENSE").read_bytes())
+                self.assertEqual(archive.read(prefix + "PACKAGE-VERSION.txt"), b"1.2.3\n")
+
 
 class CombinedWorkflowTests(unittest.TestCase):
     def setUp(self):
         self.workflow = load("workflow", SCRIPTS.parent)
 
-    def exercise(self, failure=None):
+    def exercise(self, failure=None, choice="1"):
         commands = []
 
         def record(*args):
@@ -141,6 +178,7 @@ class CombinedWorkflowTests(unittest.TestCase):
         with patch.object(self.workflow, "prepare_environment", return_value=Path("venv-python")), \
                 patch.object(self.workflow.shutil, "which", return_value="git"), \
                 patch.object(self.workflow, "run", side_effect=record), \
+                patch("builtins.input", return_value=choice), \
                 contextlib.redirect_stdout(io.StringIO()):
             if failure:
                 with self.assertRaises(subprocess.CalledProcessError):
@@ -160,6 +198,12 @@ class CombinedWorkflowTests(unittest.TestCase):
 
     def test_cancelled_or_failed_push_never_builds(self):
         self.assertEqual(len(self.exercise(failure=2)), 2)
+
+    def test_skip_push_goes_directly_from_tests_to_build_menu(self):
+        self.assertEqual([Path(c[1]).name for c in self.exercise(choice="2")], ["test.py", "build.py"])
+
+    def test_finish_after_tests_does_not_push_or_build(self):
+        self.assertEqual([Path(c[1]).name for c in self.exercise(choice="0")], ["test.py"])
 
     def test_dependency_failure_never_runs_tests_or_push(self):
         with patch.object(self.workflow.shutil, "which", return_value="git"), \

@@ -42,22 +42,39 @@ def main():
     parser.add_argument("message", nargs="?", help="optional commit message")
     args = parser.parse_args()
     validate()
+    print("\nGitHub destination: prab-s/powerterm — branch main", flush=True)
+    print("Files to review (?? = new, M = modified, D = deleted):", flush=True)
     git("status", "--short", "--branch", "--untracked-files=all")
     # Refresh only the expected branch; reject divergence before changing the index.
     git("fetch", "--no-tags", "origin", "refs/heads/main")
     if subprocess.run(["git", "merge-base", "--is-ancestor", "FETCH_HEAD", "HEAD"], cwd=ROOT).returncode:
         raise RuntimeError("Local main is behind or diverged from origin/main. Reconcile it manually first.")
     dirty = bool(git("status", "--porcelain", "--untracked-files=all", capture=True))
+    print("\nExisting commits waiting to be pushed:", flush=True)
     git("log", "--oneline", "FETCH_HEAD..HEAD")
-    action = "Stage ALL non-ignored changes, commit if needed, and push" if dirty else "Push existing commits"
-    if input(f"{action} to origin main? Type yes: ").strip().lower() != "yes":
-        print("Cancelled; nothing staged, committed, or pushed.")
-        return 2
     message = args.message
     if dirty and not message:
         message = input("Commit message [Update PowerTerm]: ").strip() or "Update PowerTerm"
     if dirty and not message.strip():
         raise RuntimeError("Commit message must not be blank.")
+    if dirty:
+        print(f"\nCommit message: {message}")
+        print("Continuing will stage ALL non-ignored changes shown above, commit, and push to origin main.")
+    else:
+        print("\nNo file changes; no new commit will be created.")
+    while True:
+        print("\n  1. Confirm and push to GitHub\n  2. Review tracked-file diff\n  0. Cancel")
+        choice = input("Choose [0]: ").strip().lower()
+        if choice in ("1", "y", "yes"):
+            break
+        if choice == "2":
+            git("--no-pager", "diff", "HEAD", "--", ".")
+            print("New untracked files are listed in status above; review their contents before pushing.")
+            continue
+        if choice in ("", "0", "n", "no", "q"):
+            print("Cancelled; nothing staged, committed, or pushed.")
+            return 2
+        print("Choose 1 to push, 2 to review, or 0 to cancel.")
     validate()
     if dirty:
         git("add", "--all", "--", ".")
@@ -73,6 +90,7 @@ def main():
     validate()
     git("-c", "remote.origin.mirror=false", "push", "--no-force", "--no-follow-tags",
         "--recurse-submodules=no", "origin", "refs/heads/main:refs/heads/main")
+    print("GitHub push completed: origin main.")
 
 
 if __name__ == "__main__":

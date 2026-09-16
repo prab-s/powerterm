@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import zipfile
 
 ROOT = Path(__file__).resolve().parent.parent
 DIST = ROOT / "dist"
@@ -37,6 +38,8 @@ def desktop(icon="powerterm"):
 
 
 def availability(target, branch):
+    if target == "windows" and platform.system() != "Windows":
+        return None  # Source kit only; the executable will be built on Windows.
     required_os = "Windows" if target == "windows" else "Linux"
     if platform.system() != required_os:
         return f"requires a native {required_os} environment"
@@ -57,6 +60,92 @@ def availability(target, branch):
         if missing:
             return "missing Python modules: " + ", ".join(missing) + "; install requirements-build.txt"
     return None
+
+
+def target_label(target):
+    return {
+        "windows": "Windows — build PowerTerm.exe" if platform.system() == "Windows" else "Windows — create a ZIP to build on your Windows computer",
+        "linux": "Linux — standalone executable",
+        "appimage": "Linux — AppImage",
+        "flatpak": "Linux — Flatpak (experimental)",
+        "deb": "Linux — Debian/Ubuntu .deb package",
+    }[target]
+
+
+def parse_selection(value, available):
+    tokens = value.lower().replace(",", " ").split()
+    if not tokens or tokens in (["q"], ["0"], ["skip"]):
+        return []
+    if tokens in (["a"], ["all"]):
+        selected = [target for target in TARGETS if available[target] is None]
+        if not selected:
+            raise ValueError("No targets are available in this environment.")
+        return selected
+    selected = []
+    for token in tokens:
+        target = TARGETS[int(token) - 1] if token in ("1", "2", "3", "4", "5") else token
+        if target not in TARGETS:
+            raise ValueError(f"Unknown choice: {token}. Use numbers 1–5 or target names.")
+        if available[target]:
+            raise ValueError(f"Cannot select {target}: {available[target]}")
+        if target not in selected:
+            selected.append(target)
+    return selected
+
+
+def choose_targets(available):
+    print("\nWhat would you like to create?")
+    for number, target in enumerate(TARGETS, 1):
+        print(f"  {number}. {target_label(target)}")
+        print(f"     {'Unavailable: ' + available[target] if available[target] else 'Ready'}")
+    print("  A. All available choices\n  0. Finish without building")
+    while True:
+        try:
+            selected = parse_selection(input("Choose numbers separated by commas (example: 1,2,5) [0]: "), available)
+        except ValueError as exc:
+            print(exc)
+            continue
+        if not selected:
+            return []
+        print("\nSelected:")
+        for target in selected:
+            print(f"  - {target_label(target)}")
+        if input("Create these now? [y/N]: ").strip().lower() in ("y", "yes"):
+            return selected
+        print("Nothing started. Choose again, or enter 0 to finish.")
+
+
+def windows_kit(work, version):
+    output = work / f"PowerTerm-{version}-windows-build-kit.zip"
+    folder = f"PowerTerm-{version}-windows-build-kit"
+    # Explicit allowlist excludes Git history, credentials, caches and host binaries.
+    files = ("main.py", "powerterm.svg", "LICENSE", "requirements.txt",
+             "requirements-build.txt", "scripts/build.py", "scripts/windows_setup.py",
+             "scripts/build-windows.bat")
+    with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for name in files:
+            archive.write(ROOT / name, f"{folder}/{name}")
+        archive.write(ROOT / "scripts/windows-kit.bat", f"{folder}/BUILD-WINDOWS.bat")
+        archive.writestr(f"{folder}/PACKAGE-VERSION.txt", version + "\n")
+        archive.writestr(f"{folder}/START-HERE.txt", """PowerTerm Windows build kit
+
+1. Install Python 3.11 or newer for Windows, including pip and the Python launcher.
+2. Extract the ENTIRE ZIP to a writable folder (do not run inside the ZIP).
+3. Double-click BUILD-WINDOWS.bat.
+4. Wait for dependency installation and the PyInstaller build to finish.
+5. Your standalone application is dist\\PowerTerm.exe.
+
+Internet access is needed for Python dependencies. Python's architecture determines
+the executable's architecture. No Git installation or repository is needed.
+The launcher never commits or pushes anything and pauses so errors remain visible.
+To retry a failed build, run BUILD-WINDOWS.bat again.
+
+This ZIP contains source and build scripts, not a prebuilt Windows executable.
+The Windows executable must be built on Windows. The original GPL licence is
+included in LICENSE and is copied beside the executable. Keep the corresponding
+source available when distributing the executable.
+""")
+    return output
 
 
 def freeze(work, onefile):
@@ -117,6 +206,8 @@ python3 -m PyInstaller --noconfirm --clean --onedir --name powerterm \\
 
 
 def package(target, work, version, branch, frozen):
+    if target == "windows" and platform.system() != "Windows":
+        return windows_kit(work, version)
     if target == "flatpak":
         return build_flatpak(work, version, branch)
     onefile = target in ("linux", "windows")
@@ -163,7 +254,7 @@ Description: PowerTerm terminal and SSH client
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("target", nargs="?", choices=(*TARGETS, "all"))
+    parser.add_argument("targets", nargs="*", help="target names or numbers, separated by spaces or commas; all selects every available choice")
     parser.add_argument("--version", default="0.1.0", help="package version (default: 0.1.0)")
     parser.add_argument("--flatpak-branch", default="25.08")
     args = parser.parse_args()
@@ -175,20 +266,18 @@ def main():
         if not (ROOT / name).is_file():
             parser.error(f"missing required project file: {name}")
     available = {t: availability(t, args.flatpak_branch) for t in TARGETS}
-    for target, reason in available.items():
-        print(f"{target}: {reason or 'available'}")
-    target = args.target
-    if target is None:
-        target = input("Build which target? windows/linux/appimage/flatpak/deb/all [all]: ").strip().lower() or "all"
-        if target not in (*TARGETS, "all"):
-            parser.error("unknown target")
-    selected = [t for t, reason in available.items() if reason is None] if target == "all" else [target]
+    if args.targets:
+        for target, reason in available.items():
+            print(f"{target_label(target)}: {reason or 'ready'}")
+        try:
+            selected = parse_selection(" ".join(args.targets), available)
+        except ValueError as exc:
+            parser.error(str(exc))
+    else:
+        selected = choose_targets(available)
     if not selected:
-        print("No native targets available.", file=sys.stderr)
-        return 1
-    if target != "all" and available[target]:
-        print(f"Cannot build {target}: {available[target]}", file=sys.stderr)
-        return 1
+        print("Finished without building.")
+        return 0
     if "flatpak" in selected:
         print("Flatpak is experimental: local shells/system information run inside its sandbox. Build downloads Python dependencies inside the SDK.")
     DIST.mkdir(exist_ok=True)
@@ -205,6 +294,8 @@ def main():
                 shutil.copy2(output, destination)
                 shutil.copy2(ROOT / "LICENSE", DIST / "LICENSE")
                 print(f"BUILT {selected_target}: {destination}", flush=True)
+                if destination.suffix == ".zip":
+                    print("Copy this ZIP to Windows, extract it, and double-click BUILD-WINDOWS.bat. Instructions are in START-HERE.txt.", flush=True)
             except (OSError, subprocess.CalledProcessError) as exc:
                 failed = True
                 print(f"FAILED {selected_target}: {exc}", file=sys.stderr)

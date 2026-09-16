@@ -379,14 +379,17 @@ python3 workflow.py "Describe the change"
 On Windows use `python workflow.py`. No virtual-environment activation is needed.
 The workflow creates or reuses the project's `.venv`, installs missing Python
 application and build dependencies from `requirements-build.txt`, checks dependency
-consistency and library imports, runs the separate test script, calls the safe push
-script, then opens the native build menu. Existing dependencies are kept when they
+consistency and library imports, runs the separate test script, then offers GitHub
+and build menus. Existing dependencies are kept when they
 satisfy the requirements. It does not install into the system Python.
 
-The push step still shows changes and requires you to type `yes`. A failed setup,
-failed test, failed push, or cancelled push stops the workflow before later steps.
-The build menu opens only after a successful push. Build failures cannot undo a
-push that has already succeeded. You can still run every script separately.
+After tests, choose `1` to review and push, `2` to skip GitHub and choose builds,
+or `0` to finish. The push script shows the commit message, offers a tracked-file
+diff, and requires a final confirmation before staging or pushing anything.
+A failed setup, failed test, failed push, or cancelled push stops later steps.
+Explicitly skipping GitHub opens the build menu using your current local files.
+Build failures cannot undo a push that has already succeeded. Every script can
+still run separately.
 
 Python and Git must already be installed. If Python lacks both `ensurepip` and an
 external pip, install your distribution's Python venv/pip packages first. OS shared
@@ -421,7 +424,9 @@ in-progress merge/rebase operations, and displays status including untracked fil
 It fetches remote `main` and stops if local `main` is behind or diverged. Reconcile
 branches manually; the script never switches branches, merges, or force-pushes.
 
-After showing outgoing commits it asks you to type `yes`. This stages **all
+After showing outgoing commits and the commit message, choose `1` to confirm,
+`2` to review the tracked-file diff, or `0` to cancel (the default). `yes` is also
+accepted as confirmation. Confirming stages **all
 non-ignored changes**, including deletions, commits if there are staged changes,
 and pushes only `main` to `origin main`. Review the displayed files first. The
 optional message defaults to an interactive prompt, then `Update PowerTerm`.
@@ -447,18 +452,54 @@ On Linux, creating a virtual environment may first require your distribution's
 ./scripts/build-linux.sh all --version 0.1.0
 ```
 
-On Windows, copy `main.py`, `powerterm.svg`, `LICENSE`, both requirements files,
-and the `scripts` directory to a local folder. Create and activate a Windows
-virtual environment, install `requirements-build.txt`, then run:
+For Windows, select `1` in the Linux build menu, or run:
+
+```bash
+python3 scripts/build.py windows
+```
+
+This creates `dist/PowerTerm-0.1.0-windows-build-kit.zip`. Copy/download it to
+Windows, extract the entire ZIP, then double-click **BUILD-WINDOWS.bat**. Install
+Python 3.11+ with pip and the Python launcher on Windows first; internet access is
+needed for dependencies. The launcher creates a Windows virtual environment,
+installs the requirements and builds `dist/PowerTerm.exe`. It pauses on completion
+or failure so the output remains visible. `START-HERE.txt` contains instructions.
+
+The ZIP includes application source, icon, original licence, requirements and the
+necessary build scripts. It excludes Git history, push scripts, virtual environments,
+local settings and Linux binaries. No Git installation is needed on Windows.
+This is a source/build kit; the `.exe` is produced on Windows, not on Linux.
+
+If you already have the project files on Windows, the launcher also works directly:
 
 ```bat
 scripts\build-windows.bat
 scripts\build-windows.bat windows
 ```
 
-`python scripts/build.py` also works directly on either OS. Without a target,
-the menu asks for `windows`, `linux`, `appimage`, `flatpak`, `deb`, or `all`.
-`all` builds every target whose prerequisites are available on the current OS,
+`python scripts/build.py` also works directly on either OS. Without targets, the
+numbered menu shows each option and its availability:
+
+1. Windows executable (on Windows) or Windows build ZIP (on Linux)
+2. Linux standalone executable
+3. Linux AppImage
+4. Linux Flatpak
+5. Debian/Ubuntu package
+
+Enter one number, several separated by commas (for example `1,2,5`), or `A` for
+all available choices. Review the selection and answer `y` to start. Enter `0`
+or press Enter at the selection prompt to finish without building. Invalid or
+unavailable selections explain the problem and let you choose again.
+
+For direct commands, names and numbers work, including multiple targets:
+
+```bash
+python scripts/build.py windows linux deb
+python scripts/build.py 1,2,5 --version 0.1.0
+```
+
+`all` creates every output whose prerequisites are available, including the
+Windows transfer ZIP on Linux. It
 prints unavailable targets, continues after individual failures, and returns
 nonzero if a selected build fails or no targets are available. Supplying an
 unavailable target directly fails. Scripts do not install host tools, download
@@ -466,7 +507,8 @@ SDKs, install packages into the system, or publish artifacts.
 
 | Target | Output in `dist/` | Requirements |
 | --- | --- | --- |
-| `windows` | `PowerTerm.exe` | Windows, application dependencies and PyInstaller |
+| `windows` on Linux | `PowerTerm-VERSION-windows-build-kit.zip` | Python and the project files |
+| `windows` on Windows | `PowerTerm.exe` | Windows, application dependencies and PyInstaller (installed by the Windows launcher) |
 | `linux` | `powerterm` | Linux, application dependencies and PyInstaller |
 | `appimage` | `PowerTerm-VERSION-ARCH.AppImage` | Linux, Python build dependencies and `appimagetool` on PATH |
 | `deb` | `powerterm_VERSION_ARCH.deb` | Linux, Python build dependencies, `dpkg` and `dpkg-deb` |
@@ -480,7 +522,8 @@ artifacts from previous runs remain, so check the `BUILT`/`FAILED` output.
 PyInstaller bundles Python, app dependencies, the SVG icon and unchanged GPL
 licence. Windows uses one-file GUI mode and includes the Windows PTY backend.
 Linux executable mode uses one file; AppImage and Debian wrap a one-directory
-bundle. No Python installation is needed on the destination machine. Native
+bundle. Running the finished executable needs no Python installation; building
+the Windows kit does require Python. Native
 system libraries and services are still required. Windows builds must run on
 Windows and Linux builds on Linux, matching the destination architecture:
 [PyInstaller's platform restrictions](https://www.pyinstaller.org/en/stable/operating-mode.html).

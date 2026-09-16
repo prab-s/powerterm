@@ -61,12 +61,23 @@ def main(argv=None):
     python = prepare_environment()
     print("2/4 Running tests (failure stops the workflow)", flush=True)
     run(python, ROOT / "scripts/test.py")
-    print("3/4 Safe Git push (confirmation required)", flush=True)
-    push_args = [python, ROOT / "scripts/push.py"]
-    if args.message is not None:
-        push_args.append(args.message)
-    run(*push_args)
-    print("4/4 Choose a native build target", flush=True)
+    print("\n3/4 GitHub\n  1. Review changes and push\n  2. Skip GitHub and choose builds\n  0. Finish now", flush=True)
+    while True:
+        choice = input("Choose [1]: ").strip() or "1"
+        if choice in ("0", "1", "2"):
+            break
+        print("Enter 1, 2, or 0.")
+    if choice == "0":
+        print("Finished after tests. Nothing pushed or built.")
+        return
+    if choice == "1":
+        push_args = [python, ROOT / "scripts/push.py"]
+        if args.message is not None:
+            push_args.append(args.message)
+        run(*push_args)
+    else:
+        print("GitHub push skipped. Builds will use the files currently in this folder.")
+    print("\n4/4 Choose builds or a Windows transfer ZIP", flush=True)
     run(python, ROOT / "scripts/build.py")
     print("Workflow completed.")
 
