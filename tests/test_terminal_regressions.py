@@ -66,13 +66,13 @@ class TerminalRegressionTests(unittest.TestCase):
         self.app.processEvents()
 
     def test_readline_redraw_keeps_cursor_at_active_prompt(self):
-        # Typical readline reverse-search redraw: save/restore, clear line,
-        # write the search prompt, then restore the editable command cursor.
+        # Clear the line, write the search prompt, then move forward 28 cells.
+        # CSI 28 C is relative to the cursor after writing the prompt.
         self.feed_now("bash$ printf 'hello\\n'")
         self.feed_now("\x1b[2K\r(reverse-i-search)`foo': bar\x1b[K\x1b[28C")
 
         self.assertEqual(self.terminal.screen.cursor.y, 0)
-        self.assertEqual(self.terminal.screen.cursor.x, len("(reverse-i-search)`foo': bar") + 12)
+        self.assertEqual(self.terminal.screen.cursor.x, len("(reverse-i-search)`foo': bar") + 28)
         self.assertEqual(self.terminal._live_cursor_document_position(), self.terminal.screen.cursor.x)
         self.assertTrue(self.terminal._is_live_view())
 

@@ -360,3 +360,166 @@ The Saved Commands actions now use two rows:
 - Row 2: `Edit`, `Remove`, `Up`, `Down`.
 
 The command tree remains explicitly added below the action area with stretch priority, so saved command groups and commands continue to occupy the remaining pane height.
+
+## Maintenance and native packaging
+
+The Linux checkout is the authoritative repository and build environment. These
+scripts locate project files relative to themselves; no development path is baked
+in. Application code and the GPL-3.0 licence are unchanged.
+
+### One-command workflow
+
+From the project root, run:
+
+```bash
+python3 workflow.py
+python3 workflow.py "Describe the change"
+```
+
+On Windows use `python workflow.py`. No virtual-environment activation is needed.
+The workflow creates or reuses the project's `.venv`, installs missing Python
+application and build dependencies from `requirements-build.txt`, checks dependency
+consistency and library imports, runs the separate test script, calls the safe push
+script, then opens the native build menu. Existing dependencies are kept when they
+satisfy the requirements. It does not install into the system Python.
+
+The push step still shows changes and requires you to type `yes`. A failed setup,
+failed test, failed push, or cancelled push stops the workflow before later steps.
+The build menu opens only after a successful push. Build failures cannot undo a
+push that has already succeeded. You can still run every script separately.
+
+Python and Git must already be installed. If Python lacks both `ensurepip` and an
+external pip, install your distribution's Python venv/pip packages first. OS shared
+libraries and optional packaging tools/SDKs are not installed by this workflow;
+missing native libraries stop the import/test checks, and unavailable packaging
+targets are reported by the build menu as described below.
+
+### Tests (separate from pushing and building)
+
+Activate the project's virtual environment, install `requirements.txt`, then run:
+
+```bash
+python scripts/test.py
+```
+
+This runs unittest discovery with Qt's offscreen platform by default and returns
+a nonzero exit status on failure. Neither the push script nor build scripts run
+tests; run them explicitly before publishing changes.
+
+### Explicit Git push
+
+From anywhere inside this checkout:
+
+```bash
+python scripts/push.py
+python scripts/push.py "Describe the change"
+```
+
+The script requires this repository on `main`, validates both effective fetch and
+push URLs for `origin` against `github.com/prab-s/powerterm` (HTTPS or SSH), rejects
+in-progress merge/rebase operations, and displays status including untracked files.
+It fetches remote `main` and stops if local `main` is behind or diverged. Reconcile
+branches manually; the script never switches branches, merges, or force-pushes.
+
+After showing outgoing commits it asks you to type `yes`. This stages **all
+non-ignored changes**, including deletions, commits if there are staged changes,
+and pushes only `main` to `origin main`. Review the displayed files first. The
+optional message defaults to an interactive prompt, then `Update PowerTerm`.
+An unchanged tree skips the commit and can still push previously created commits.
+Cancellation does not stage, commit, or push. A failed push leaves local commits
+intact. Cancellation exits with status 2. The root `workflow.py` calls this script
+for its push step; the test and build scripts never push to GitHub.
+
+### Build setup and selection
+
+Use Python 3.11+ and an activated virtual environment on the target OS:
+
+```bash
+python -m pip install -r requirements-build.txt
+```
+
+On Linux, creating a virtual environment may first require your distribution's
+`python3-venv` package. Build commands:
+
+```bash
+./scripts/build-linux.sh
+./scripts/build-linux.sh linux
+./scripts/build-linux.sh all --version 0.1.0
+```
+
+On Windows, copy `main.py`, `powerterm.svg`, `LICENSE`, both requirements files,
+and the `scripts` directory to a local folder. Create and activate a Windows
+virtual environment, install `requirements-build.txt`, then run:
+
+```bat
+scripts\build-windows.bat
+scripts\build-windows.bat windows
+```
+
+`python scripts/build.py` also works directly on either OS. Without a target,
+the menu asks for `windows`, `linux`, `appimage`, `flatpak`, `deb`, or `all`.
+`all` builds every target whose prerequisites are available on the current OS,
+prints unavailable targets, continues after individual failures, and returns
+nonzero if a selected build fails or no targets are available. Supplying an
+unavailable target directly fails. Scripts do not install host tools, download
+SDKs, install packages into the system, or publish artifacts.
+
+| Target | Output in `dist/` | Requirements |
+| --- | --- | --- |
+| `windows` | `PowerTerm.exe` | Windows, application dependencies and PyInstaller |
+| `linux` | `powerterm` | Linux, application dependencies and PyInstaller |
+| `appimage` | `PowerTerm-VERSION-ARCH.AppImage` | Linux, Python build dependencies and `appimagetool` on PATH |
+| `deb` | `powerterm_VERSION_ARCH.deb` | Linux, Python build dependencies, `dpkg` and `dpkg-deb` |
+| `flatpak` | `PowerTerm-VERSION-ARCH.flatpak` | Linux, `flatpak`, Freedesktop SDK and Platform, network access for Python dependencies |
+
+The default package version is `0.1.0`; pass `--version` for releases. This is
+packaging metadata, not a change to the app. Temporary build files go under
+`build/`; successful artifacts replace matching filenames in `dist/`. Old
+artifacts from previous runs remain, so check the `BUILT`/`FAILED` output.
+
+PyInstaller bundles Python, app dependencies, the SVG icon and unchanged GPL
+licence. Windows uses one-file GUI mode and includes the Windows PTY backend.
+Linux executable mode uses one file; AppImage and Debian wrap a one-directory
+bundle. No Python installation is needed on the destination machine. Native
+system libraries and services are still required. Windows builds must run on
+Windows and Linux builds on Linux, matching the destination architecture:
+[PyInstaller's platform restrictions](https://www.pyinstaller.org/en/stable/operating-mode.html).
+
+Build Linux releases on the oldest distribution you intend to support. Bundling
+does not make glibc or Qt's system requirements portable to older distributions.
+The Debian package declares common Qt system dependencies but has not been
+qualified against every Debian/Ubuntu release. AppImage creation follows the
+[AppDir format](https://docs.appimage.org/reference/appdir.html); `appimagetool`
+may require FUSE or an extracted tool installation on restricted servers.
+Smoke-test each artifact on its destination desktop, including local terminals,
+SSH, file access, icon display and credential storage, before distribution.
+
+### Experimental Flatpak
+
+Install matching `org.freedesktop.Sdk` and `org.freedesktop.Platform` runtimes
+first. The default branch is `25.08`; override with `--flatpak-branch` if needed.
+For example, if the Flathub remote is already configured:
+
+```bash
+flatpak install --user flathub org.freedesktop.Sdk//25.08 org.freedesktop.Platform//25.08
+./scripts/build-linux.sh flatpak
+```
+
+This local packaging script builds PyInstaller **inside the SDK**, fetching Python
+build dependencies there through pip, then exports a `.flatpak` bundle using the
+[Flatpak build commands](https://docs.flatpak.org/en/latest/first-build.html).
+The SDK must provide Python and pip. It does not reuse a host-built binary. This
+is an experimental local build, not an offline, reproducible Flathub submission.
+Installing the bundle requires the matching runtime; the bundle does not embed it.
+
+The sandbox grants home-directory access, networking, display/GPU access and
+access to the Secret Service credential store. Local terminals use `/bin/sh`
+**inside the sandbox**, and system-information commands see the sandbox's view.
+Host shells, arbitrary host paths, and host administration do not behave like
+the native executable. The launcher sets the sandbox shell without modifying
+application code. Use the native Linux build when host-terminal behaviour is
+required; Flatpak needs further integration work for that use case.
+
+The original `LICENSE` remains unchanged and is included in packages and beside
+artifacts. When distributing binaries, also provide corresponding source and
+applicable dependency licence notices under their respective terms.
