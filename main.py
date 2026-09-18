@@ -734,6 +734,11 @@ class TerminalWidget(QPlainTextEdit):
     save_output_requested = Signal()
     focus_activated = Signal()
     OSC7_RE = re.compile(r"\x1b]7;([^\x07\x1b]*)(?:\x07|\x1b\\)")
+    REDRAW_ERASE_RE = re.compile(r"\x1b\[[0-9;?]*[JKPX]")
+    DELETE_CHARACTER_RE = re.compile(r"\x1b\[[0-9;?]*P")
+    READLINE_REPOSITION_RE = re.compile(
+        r"^(?P<up>(?:\x1b\[(?:\d+)?A)+)\r(?P<right>(?:\x1b\[(?:\d+)?C)+)"
+    )
     SEMANTIC_TOKEN_RE = re.compile(
         r"(https?://\S+|(?:[A-Za-z]:\\|/)[^\s'\"<>|]+|"
         r"--?[A-Za-z][\w-]*|\b(?:error|failed|failure|fatal|denied)\b|"
@@ -753,10 +758,12 @@ class TerminalWidget(QPlainTextEdit):
         self.setUndoRedoEnabled(False)
         self.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
         self.setTabChangesFocus(False)
-        # Critical for terminal stability: document scrollbars must never resize
-        # the terminal viewport. Scrollback is handled by the terminal emulator,
-        # not QTextEdit's own document scrollbars.
-        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        # The document contains the complete terminal scrollback. Keeping its
+        # native scrollbar lets Qt retain mouse selections as their text moves
+        # through the viewport, rather than reusing one screen-high canvas.
+        # Keep it visible even with little output so its width never changes
+        # the PTY geometry midway through a session.
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.setStyleSheet("QPlainTextEdit { background:#101010; color:#eeeeec; border:0; padding:6px; }")
         self.scrollback_limit = 10000
@@ -771,7 +778,7 @@ class TerminalWidget(QPlainTextEdit):
         self._history_offset = 0
         self._deferred_output = []
         self._deferred_output_chars = 0
-        self._wheel_delta = 0
+        self._setting_scroll_position = False
 
         # Keep a bounded raw output journal. Width changes rebuild the emulator
         # from this journal instead of destructively clipping pyte's sparse
@@ -789,6 +796,8 @@ class TerminalWidget(QPlainTextEdit):
         self._private_startup_buffer = None
         self._private_startup_generation = 0
         self._rendered_rows = None
+        self._requires_full_document_rebuild = False
+        self._redraw_control_tail = ""
         self._last_bell_time = 0.0
         self._cursor_on = True
         self._cursor_timer = QTimer(self)
@@ -803,13 +812,20 @@ class TerminalWidget(QPlainTextEdit):
         self._resize_timer.setSingleShot(True)
         self._resize_timer.setInterval(40)
         self._resize_timer.timeout.connect(self._apply_terminal_resize)
+        # Keep the emulator geometry separate from the geometry last sent to
+        # a backend. A terminal can be laid out before its backend is attached
+        # (notably when a window opens maximized), so matching emulator
+        # geometry must not suppress that backend's first PTY resize.
         self._last_terminal_size = None
+        self._last_backend_size = None
+        self._backend_geometry_needs_sync = False
 
         self.line_numbers_visible = False
         self.line_number_area = TerminalLineNumberArea(self)
         self.line_number_area.hide()
         self.blockCountChanged.connect(self.update_line_number_area_width)
         self.updateRequest.connect(self.update_line_number_area)
+        self.verticalScrollBar().valueChanged.connect(self._scroll_position_changed)
         self.update_line_number_area_width()
 
     def begin_private_startup_transaction(self, timeout_ms=2500):
@@ -927,7 +943,10 @@ class TerminalWidget(QPlainTextEdit):
             if raw:
                 new_stream.feed(raw)
 
-            if preserve_cursor:
+            # Before the first backend output there is no terminal content to
+            # anchor. Keeping the blank 100x30 screen's cursor relative to the
+            # bottom would put the initial prompt partway down a larger window.
+            if preserve_cursor and (raw or (old_cursor_x, old_cursor_y) != (0, 0)):
                 # Interactive shells keep the active prompt relative to the
                 # bottom edge. Preserving an absolute row while maximizing
                 # leaves the cursor stranded around the middle of the canvas.
@@ -971,17 +990,15 @@ class TerminalWidget(QPlainTextEdit):
                 result.append({})
         return result
 
-    def _visible_snapshot(self):
-        all_lines = self._history_snapshot()
-        page = max(1, self.screen.lines)
-        max_offset = max(0, len(all_lines) - page)
-        self._history_offset = max(0, min(self._history_offset, max_offset))
-        end = len(all_lines) - self._history_offset
-        start = max(0, end - page)
-        visible = all_lines[start:end]
-        if len(visible) < page:
-            visible = ([{}] * (page - len(visible))) + visible
-        return visible
+    def _scroll_position_changed(self, value):
+        """Track whether Qt is showing history or the live terminal bottom."""
+        if self._setting_scroll_position:
+            return
+        scrollbar = self.verticalScrollBar()
+        self._history_scrolled = value < scrollbar.maximum()
+        self._history_offset = max(0, scrollbar.maximum() - value)
+        if not self._history_scrolled and self._deferred_output:
+            self._return_to_live()
 
     def apply_settings(self, cursor_style="ibeam", cursor_blink=True, font_family="Monospace", font_size=11, scrollback_limit=10000, syntax_highlighting=True):
         self.cursor_style = cursor_style if cursor_style in ("ibeam", "block", "underline") else "ibeam"
@@ -1026,7 +1043,10 @@ class TerminalWidget(QPlainTextEdit):
         self._deferred_output_chars = 0
         self._replay_chunks.clear()
         self._replay_chars = 0
+        self._redraw_control_tail = ""
         self._last_terminal_size = None
+        self._last_backend_size = None
+        self._backend_geometry_needs_sync = False
         self.clear()
         self._rendered_rows = None
         self._send_resize()
@@ -1037,6 +1057,10 @@ class TerminalWidget(QPlainTextEdit):
         if reset:
             self.reset_terminal()
         self.backend = backend
+        # This is a newly attached process/channel even when its terminal
+        # widget kept its current screen during a reconnect.
+        self._last_backend_size = None
+        self._backend_geometry_needs_sync = True
         self._session_active = True
         backend.data.connect(self.feed)
         backend.error.connect(lambda m: QMessageBox.warning(self, "Terminal", m))
@@ -1080,7 +1104,11 @@ class TerminalWidget(QPlainTextEdit):
             self._private_startup_generation += 1
         # While the user is looking back through history, keep that viewport stable.
         # Output is queued briefly and applied when they return to the live page.
-        if self._history_scrolled:
+        # An active mouse selection can move Qt's viewport by one row merely
+        # to expose its endpoint. Do not treat that as a request to freeze
+        # output: render it and preserve the selection/document position.
+        # Deliberate history browsing without a selection still defers output.
+        if self._history_scrolled and not self.textCursor().hasSelection():
             self._deferred_output.append(text)
             self._deferred_output_chars += len(text)
             # Do not allow unbounded buffering during a very noisy command.
@@ -1104,6 +1132,14 @@ class TerminalWidget(QPlainTextEdit):
             return
         text = "".join(self._input_buffer)
         self._input_buffer.clear()
+        previous_cursor = (self.screen.cursor.x, self.screen.cursor.y)
+        prompt_snapshot = self._capture_readline_prompt(text, previous_cursor)
+        # A local PTY can produce its initial prompt before the debounced Qt
+        # layout timer runs. Resolve the displayed geometry here too, before
+        # that prompt is interpreted, so a terminal opened in an already
+        # maximized window cannot leave readline using the provisional size.
+        if self._backend_geometry_needs_sync:
+            self._apply_terminal_resize()
         # BEL (0x07) may also terminate OSC sequences, so strip OSC controls
         # before deciding whether the terminal actually rang its bell.
         bell_probe = re.sub(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)", "", text)
@@ -1123,8 +1159,23 @@ class TerminalWidget(QPlainTextEdit):
                     self.cwd_changed.emit(path)
             except Exception:
                 pass
+        redraw_probe = self._redraw_control_tail + text
+        if prompt_snapshot is not None and self.DELETE_CHARACTER_RE.search(redraw_probe):
+            text = self._correct_readline_prompt_row(text)
+            redraw_probe = self._redraw_control_tail + text
         self._record_replay(text)
         self.stream.feed(text)
+        # Readline/PSReadLine compactly redraw history entries using cursor
+        # movement followed by erase/delete controls. The logical screen is
+        # correct in pyte, but explicitly invalidate Qt's document after these
+        # controls so removed tail glyphs cannot survive a partial repaint.
+        # PTY/SSH reads may split a sequence such as CSI 5 P into "ESC[5"
+        # and "P". Keep a short tail so destructive redraw controls are
+        # recognised even when their bytes arrive in separate callbacks.
+        self._requires_full_document_rebuild |= bool(self.REDRAW_ERASE_RE.search(redraw_probe))
+        if self.DELETE_CHARACTER_RE.search(redraw_probe):
+            self._clear_shortened_readline_tail(previous_cursor)
+        self._redraw_control_tail = redraw_probe[-32:]
         # Readline redraws are latency-sensitive: Ctrl-R, completion cycling,
         # and cursor movement arrive as control sequences and must be visible
         # in the next GUI turn. Ordinary output remains coalesced briefly.
@@ -1135,6 +1186,93 @@ class TerminalWidget(QPlainTextEdit):
         elif not self._render_pending:
             self._render_pending = True
             QTimer.singleShot(6, self.render_screen)
+
+    @staticmethod
+    def _readline_motion_count(sequence, direction):
+        return sum(int(value or 1) for value in re.findall(rf"\x1b\[(\d*){direction}", sequence))
+
+    def _capture_readline_prompt(self, text, previous_cursor):
+        """Save a prompt pyte has placed one row below readline's target."""
+        match = self.READLINE_REPOSITION_RE.match(text)
+        if not match:
+            return None
+        up = self._readline_motion_count(match.group("up"), "A")
+        right = self._readline_motion_count(match.group("right"), "C")
+        target_y = int(previous_cursor[1]) - up
+        source_y = target_y + 1
+        columns = int(self.screen.columns)
+        if not (0 <= target_y < self.screen.lines and 0 <= source_y < self.screen.lines):
+            return None
+        width = max(1, min(columns, right))
+        default_cell = getattr(self.screen, "default_char", None)
+        target = self.screen.buffer[target_y]
+        source = self.screen.buffer[source_y]
+        target_cells = [target.get(x, default_cell) for x in range(width)]
+        source_cells = [source.get(x, default_cell) for x in range(width)]
+        if any(cell is not None and (cell.data or "").strip() for cell in target_cells):
+            return None
+        if not any(cell is not None and (cell.data or "").strip() for cell in source_cells):
+            return None
+        # A continuation of the command can also begin on the next row. Only
+        # move a real, styled shell prompt; ordinary command text must remain
+        # where pyte placed it.
+        if not any(
+            cell is not None and (cell.data or "").strip()
+            and not self._cell_uses_default_colours(cell)
+            for cell in source_cells
+        ):
+            return None
+        return target_y, source_cells
+
+    def _correct_readline_prompt_row(self, text):
+        """Keep readline's redraw in pyte's existing styled-prompt row."""
+        match = self.READLINE_REPOSITION_RE.match(text)
+        if match is None:
+            return text
+        up = match.group("up")
+        motions = list(re.finditer(r"\x1b\[(\d*)A", up))
+        if not motions:
+            return text
+        last = motions[-1]
+        count = int(last.group(1) or 1)
+        replacement = "" if count == 1 else f"\x1b[{count - 1}A"
+        corrected_up = up[:last.start()] + replacement + up[last.end():]
+        corrected = corrected_up + text[match.end("up"):]
+        return corrected
+
+    def _clear_shortened_readline_tail(self, previous_cursor):
+        """Clear cells left after readline shortens a wrapped input line.
+
+        Bash uses DCH (CSI n P) while replacing one history entry with another.
+        pyte applies DCH to its current physical row, but does not clear the
+        continuation cells of the old wrapped input. A real terminal no longer
+        shows those cells once readline has moved the cursor to the shorter
+        replacement. Clear only the range from the new cursor to the previous
+        input endpoint, preserving all earlier terminal output.
+        """
+        old_x, old_y = previous_cursor
+        new_x = int(self.screen.cursor.x)
+        new_y = int(self.screen.cursor.y)
+        columns = int(self.screen.columns)
+        lines = int(self.screen.lines)
+        old_x = max(0, min(columns, int(old_x)))
+        old_y = max(0, min(lines - 1, int(old_y)))
+        new_x = max(0, min(columns, new_x))
+        new_y = max(0, min(lines - 1, new_y))
+
+        if (new_y, new_x) >= (old_y, old_x):
+            return
+
+        default_cell = getattr(self.screen, "default_char", None)
+        if default_cell is None:
+            return
+        for y in range(new_y, old_y + 1):
+            start = new_x if y == new_y else 0
+            end = old_x if y == old_y else columns
+            line = self.screen.buffer[y]
+            for x in range(start, end):
+                line[x] = default_cell
+        self._requires_full_document_rebuild = True
 
     @staticmethod
     def _cell_style_key(cell):
@@ -1219,7 +1357,17 @@ class TerminalWidget(QPlainTextEdit):
     def render_screen(self):
         self._render_pending = False
         live_view = self._is_live_view()
-        visible_lines = self._visible_snapshot()
+        # setPlainText() is needed when scrollback gains or loses rows, but it
+        # resets Qt's current selection. Preserve its document endpoints so a
+        # completed multi-line selection remains available for copying after
+        # ordinary terminal output adds a new line.
+        active_cursor = self.textCursor()
+        selection = (active_cursor.anchor(), active_cursor.position()) if active_cursor.hasSelection() else None
+        # Render the entire immutable scrollback snapshot into the document.
+        # Unlike a rolling one-page canvas, this gives every displayed line a
+        # stable document position, so Qt can preserve a multi-line selection
+        # while the user scrolls through it.
+        visible_lines = self._history_snapshot()
 
         self.setUpdatesEnabled(False)
         try:
@@ -1234,7 +1382,13 @@ class TerminalWidget(QPlainTextEdit):
             # Establish a fixed-size document once. Subsequent redraws update
             # only changed blocks, which is dramatically cheaper for readline
             # echo and cursor movement than clearing/rebuilding the canvas.
-            if self._rendered_rows is None or len(self._rendered_rows) != len(rows):
+            # A destructive readline redraw can combine DCH/ECH/EL operations
+            # across wrapped rows. Rebuild the Qt document from pyte's final
+            # state in that case: it is more reliable than several in-place
+            # block replacements, which can leave a stale suffix painted after
+            # a shorter history entry replaces a longer one.
+            if (self._requires_full_document_rebuild or self._rendered_rows is None
+                    or len(self._rendered_rows) != len(rows)):
                 plain = "\n".join("".join(cell[0] or " " for cell in row) for row in rows)
                 self.setPlainText(plain)
                 changed = range(len(rows))
@@ -1276,22 +1430,36 @@ class TerminalWidget(QPlainTextEdit):
         finally:
             self.setUpdatesEnabled(True)
 
-        # QPlainTextEdit has its own document viewport, independent of pyte's
-        # cursor. Keep live terminal output at the bottom and leave history
-        # browsing untouched. This is essential after readline clears and
-        # redraws a line during reverse search or completion cycling.
+        if selection:
+            anchor, position = selection
+            document_end = max(0, self.document().characterCount() - 1)
+            restored = QTextCursor(self.document())
+            restored.setPosition(min(anchor, document_end))
+            restored.setPosition(min(position, document_end), QTextCursor.MoveMode.KeepAnchor)
+            self.setTextCursor(restored)
+
+        if self._requires_full_document_rebuild:
+            self._requires_full_document_rebuild = False
+
+        # Keep live terminal output at the bottom. When browsing history leave
+        # Qt's document position alone, preserving mouse selections and the
+        # visible text instead of pinning a replacement page to the top.
         if live_view:
             scrollbar = self.verticalScrollBar()
-            scrollbar.setValue(scrollbar.maximum())
+            self._setting_scroll_position = True
+            try:
+                scrollbar.setValue(scrollbar.maximum())
+                self._history_scrolled = False
+                self._history_offset = 0
+            finally:
+                self._setting_scroll_position = False
             self.horizontalScrollBar().setValue(0)
-        else:
-            self.verticalScrollBar().setValue(0)
 
         self._cursor_on = self._session_active
         self.viewport().update()
 
     def _is_live_view(self):
-        return not self._history_scrolled and self._history_offset == 0
+        return not self._history_scrolled
 
     def _live_cursor_document_position(self):
         """Map pyte's live cursor to the fixed-width Qt terminal document."""
@@ -1299,7 +1467,9 @@ class TerminalWidget(QPlainTextEdit):
         rows = max(1, int(getattr(self.screen, "lines", 1)))
         x = max(0, min(columns - 1, int(getattr(self.screen.cursor, "x", 0))))
         y = max(0, min(rows - 1, int(getattr(self.screen.cursor, "y", 0))))
-        return y * (columns + 1) + x
+        # History rows precede the live screen in the document.
+        history_rows = max(0, len(self._history_snapshot()) - rows)
+        return (history_rows + y) * (columns + 1) + x
 
     def paintEvent(self, event):
         super().paintEvent(event)
@@ -1434,6 +1604,7 @@ class TerminalWidget(QPlainTextEdit):
         size = (cols, rows)
 
         if size == self._last_terminal_size:
+            self._resize_backend(cols, rows)
             return
         self._last_terminal_size = size
 
@@ -1446,15 +1617,22 @@ class TerminalWidget(QPlainTextEdit):
             # Tell the actual PTY first so interactive programs can redraw for
             # the new geometry. Then rebuild pyte from the output journal rather
             # than calling Screen.resize(), which clips existing cells.
-            if self.backend:
-                self.backend.resize(cols, rows)
+            self._resize_backend(cols, rows)
             self._rebuild_screen(cols, rows)
             self.render_screen()
-        elif self.backend:
+        else:
+            self._resize_backend(cols, rows)
+
+    def _resize_backend(self, cols, rows):
+        """Send each backend the terminal geometry once after attachment."""
+        size = (cols, rows)
+        if self.backend and size != self._last_backend_size:
             self.backend.resize(cols, rows)
+            self._last_backend_size = size
+            self._backend_geometry_needs_sync = False
 
     def _history_at_bottom(self):
-        return self._history_offset == 0
+        return not self._history_scrolled
 
     def _return_to_live(self, flush_now=False):
         self._history_offset = 0
@@ -1472,41 +1650,25 @@ class TerminalWidget(QPlainTextEdit):
                 QTimer.singleShot(0, self._process_input_batch)
         else:
             self.render_screen()
+        scrollbar = self.verticalScrollBar()
+        self._setting_scroll_position = True
+        try:
+            scrollbar.setValue(scrollbar.maximum())
+        finally:
+            self._setting_scroll_position = False
 
     def wheelEvent(self, event):
-        # Never call HistoryScreen.prev_page()/next_page(). On current pyte/
-        # Python combinations those methods can mutate sparse line dictionaries
-        # while iterating them. Browse immutable snapshots instead.
-        self._wheel_delta += event.angleDelta().y()
-        if abs(self._wheel_delta) < 120:
-            event.accept()
-            return
-
-        steps = max(1, abs(self._wheel_delta) // 120)
-        direction = 1 if self._wheel_delta > 0 else -1
-        self._wheel_delta = 0
-        increment = max(1, min(5, self.screen.lines // 6)) * steps
-
-        snapshot_len = len(self._history_snapshot())
-        max_offset = max(0, snapshot_len - self.screen.lines)
-
-        if direction > 0:
-            self._history_offset = min(max_offset, self._history_offset + increment)
-        else:
-            self._history_offset = max(0, self._history_offset - increment)
-
-        self._history_scrolled = self._history_offset > 0
-        if not self._history_scrolled and self._deferred_output:
-            self._return_to_live()
-        else:
-            self.render_screen()
-        event.accept()
+        # Native QPlainTextEdit scrolling keeps selections anchored to document
+        # text. The scrollbar callback records whether this is history view.
+        super().wheelEvent(event)
 
     def close_backend(self):
         if self.backend:
             self._session_active = False
             self._cursor_timer.stop()
             self.backend.close(); self.backend = None
+            self._last_backend_size = None
+            self._backend_geometry_needs_sync = False
 
 
 # ----------------------------- Host profiles ---------------------------------
@@ -5759,7 +5921,7 @@ class MainWindow(QMainWindow):
                 if dt > 0: cpu_text = f"CPU {(100.0*(dt-di)/dt):4.1f}%"
             self.remote_prev_cpu = (total, idle)
         mt, ma = snapshot.get("mem", (0,0)); mem_text = f"RAM {100.0*(mt-ma)/mt:4.1f}%" if mt else "RAM ?"
-        _, _, dp = snapshot.get("disk", (0,0,"?")); disk_text = f"Disk {dp}" if dp != "?" else "Disc ?"
+        _, _, dp = snapshot.get("disk", (0,0,"?")); disk_text = f"Disc {dp}" if dp != "?" else "Disc ?"
         rx, tx = snapshot.get("net", (0,0)); now = time.monotonic(); net_text = "Network ?"
         if self.remote_prev_net:
             prx, ptx, pt = self.remote_prev_net; elapsed=max(.001, now-pt); net_text=f"↓ {human_rate(max(0,rx-prx)/elapsed)}  ↑ {human_rate(max(0,tx-ptx)/elapsed)}"

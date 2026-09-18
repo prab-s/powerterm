@@ -83,10 +83,10 @@ class TerminalRegressionTests(unittest.TestCase):
 
     def test_history_view_is_not_forced_to_bottom(self):
         self.feed_now("one\r\ntwo\r\nthree\r\n")
-        self.terminal._history_offset = 1
-        self.terminal._history_scrolled = True
-        self.terminal.render_screen()
-        self.assertNotEqual(self.terminal.verticalScrollBar().value(), self.terminal.verticalScrollBar().maximum())
+        scrollbar = self.terminal.verticalScrollBar()
+        scrollbar.setValue(max(scrollbar.minimum(), scrollbar.maximum() - 1))
+        self.assertTrue(self.terminal._history_scrolled)
+        self.assertNotEqual(scrollbar.value(), scrollbar.maximum())
 
     def test_resize_preserves_terminal_cursor_coordinates(self):
         self.feed_now("prompt> abc")
@@ -100,6 +100,61 @@ class TerminalRegressionTests(unittest.TestCase):
         self.terminal._rebuild_screen(140, 60)
         self.assertEqual(self.terminal.screen.cursor.x, 7)
         self.assertEqual(self.terminal.screen.cursor.y, 58)
+
+    def test_initial_resize_keeps_an_empty_terminal_cursor_at_the_top(self):
+        self.terminal.reset_terminal()
+        self.terminal._rebuild_screen(167, 46)
+        self.assertEqual((self.terminal.screen.cursor.x, self.terminal.screen.cursor.y), (0, 0))
+
+    def test_new_backend_receives_resize_when_terminal_was_already_laid_out(self):
+        class Backend:
+            def __init__(self):
+                self.sizes = []
+
+            def resize(self, cols, rows):
+                self.sizes.append((cols, rows))
+
+        # Simulate opening a terminal in a maximized window: Qt has already
+        # measured and sized the emulator before the process is attached.
+        metrics = self.terminal.fontMetrics()
+        laid_out_size = (
+            max(20, (self.terminal.viewport().width() - 4) // max(1, metrics.horizontalAdvance("M"))),
+            max(5, (self.terminal.viewport().height() - 4) // max(1, metrics.height())),
+        )
+        backend = Backend()
+        self.terminal.backend = backend
+        self.terminal._last_terminal_size = laid_out_size
+        self.terminal._last_backend_size = None
+        self.terminal._apply_terminal_resize()
+
+        self.assertEqual(backend.sizes, [laid_out_size])
+        self.terminal._apply_terminal_resize()
+        self.assertEqual(backend.sizes, [laid_out_size])
+
+    def test_first_terminal_output_synchronises_the_backend_geometry(self):
+        class Backend:
+            def __init__(self):
+                self.sizes = []
+
+            def resize(self, cols, rows):
+                self.sizes.append((cols, rows))
+
+        metrics = self.terminal.fontMetrics()
+        displayed_size = (
+            max(20, (self.terminal.viewport().width() - 4) // max(1, metrics.horizontalAdvance("M"))),
+            max(5, (self.terminal.viewport().height() - 4) // max(1, metrics.height())),
+        )
+        backend = Backend()
+        self.terminal.backend = backend
+        # Represent the provisional dimensions used while the tab was being
+        # created, before the window manager completed its maximized layout.
+        self.terminal._last_terminal_size = (100, 30)
+        self.terminal._last_backend_size = (100, 30)
+        self.terminal._backend_geometry_needs_sync = True
+
+        self.feed_now("shell prompt> ")
+
+        self.assertEqual(backend.sizes, [displayed_size])
 
     def test_terminal_input_contract_for_ctrl_r_and_tab(self):
         class Backend:
@@ -159,7 +214,7 @@ class TerminalRegressionTests(unittest.TestCase):
 
         self.assertTrue(self.terminal.isReadOnly())
         self.assertEqual(self.terminal.lineWrapMode(), self.terminal.LineWrapMode.NoWrap)
-        self.assertEqual(self.terminal.verticalScrollBarPolicy(), Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.assertEqual(self.terminal.verticalScrollBarPolicy(), Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
         self.assertEqual(self.terminal.horizontalScrollBarPolicy(), Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.assertIn("#101010", self.terminal.styleSheet())
         self.assertFalse(self.terminal.line_numbers_visible)
@@ -169,6 +224,183 @@ class TerminalRegressionTests(unittest.TestCase):
         self.terminal.setFocus()
         self.app.processEvents()
         self.assertTrue(self.terminal.focusPolicy() & Qt.FocusPolicy.StrongFocus)
+
+    def test_scrollback_selection_stays_attached_to_text_while_scrolling(self):
+        self.terminal._rebuild_screen(30, 5)
+        self.feed_now("".join(f"history line {number:02d}\r\n" for number in range(16)))
+        document = self.terminal.document()
+        start = document.toPlainText().index("history line 02")
+        end = document.toPlainText().index("history line 05") + len("history line 05")
+        selection = self.terminal.textCursor()
+        selection.setPosition(start)
+        selection.setPosition(end, selection.MoveMode.KeepAnchor)
+        self.terminal.setTextCursor(selection)
+        selected_before = selection.selectedText()
+
+        scrollbar = self.terminal.verticalScrollBar()
+        self.assertGreater(scrollbar.maximum(), scrollbar.minimum())
+        scrollbar.setValue(scrollbar.minimum())
+        self.app.processEvents()
+
+        self.assertTrue(self.terminal._history_scrolled)
+        self.assertEqual(self.terminal.textCursor().selectedText(), selected_before)
+        self.assertIn("history line 02", self.terminal.textCursor().selectedText())
+        self.assertIn("history line 05", self.terminal.textCursor().selectedText())
+
+    def test_scrollback_selection_survives_new_terminal_output(self):
+        self.terminal._rebuild_screen(30, 5)
+        self.feed_now("".join(f"selected history {number:02d}\r\n" for number in range(16)))
+        scrollbar = self.terminal.verticalScrollBar()
+        scrollbar.setValue(scrollbar.maximum())
+        document = self.terminal.document()
+        # Select visible, recent rows so the terminal remains at its live
+        # bottom while new output arrives.
+        start = document.toPlainText().index("selected history 14")
+        end = document.toPlainText().index("selected history 15") + len("selected history 15")
+        selection = self.terminal.textCursor()
+        selection.setPosition(start)
+        selection.setPosition(end, selection.MoveMode.KeepAnchor)
+        self.terminal.setTextCursor(selection)
+        selected_before = selection.selectedText()
+
+        self.feed_now("new output after selection\r\n")
+
+        self.assertEqual(self.terminal.textCursor().selectedText(), selected_before)
+        self.assertIn("new output after selection", self.terminal.document().toPlainText())
+
+    def test_multiline_readline_redraw_replaces_only_the_live_rows(self):
+        self.terminal._rebuild_screen(32, 5)
+        self.feed_now("".join(f"old line {number}\r\n" for number in range(10)))
+        old_history = self.terminal.document().toPlainText()
+        self.feed_now("\x1b[2A\r\x1b[2K(reverse-i-search)`one': first\r\n\x1b[2K(reverse-i-search)`two': second\x1b[8D")
+
+        rendered = self.terminal.document().toPlainText()
+        self.assertIn("old line 1", rendered)
+        self.assertIn("(reverse-i-search)`one': first", rendered)
+        self.assertIn("(reverse-i-search)`two': second", rendered)
+        self.assertEqual(self.terminal._live_cursor_document_position(),
+                         rendered.rfind("(reverse-i-search)`two': second") + len("(reverse-i-search)`two': second") - 8)
+
+    def test_readline_shrinking_wrapped_history_entry_erases_its_tail(self):
+        # This is Bash/readline's actual compact redraw form for changing from
+        # a long wrapped history entry back to "echo short": movement, DCH,
+        # line erases, then cursor repositioning.
+        self.terminal._rebuild_screen(20, 5)
+        self.feed_now("P> echo this-command-is-much-longer-than-short")
+        self.feed_now(
+            "\x1b[A\x1b[A\x1b[C\x1b[C\x1b[7Pshort\r\n\r\x1b[K"
+            "\r\n\r\x1b[K\x1b[A\x1b[A" + "\x1b[C" * 15
+        )
+
+        rows = self.terminal.document().toPlainText().splitlines()[-5:]
+        self.assertEqual(rows[0].rstrip(), "P> echo short")
+        self.assertTrue(all(not row.strip() for row in rows[1:]))
+        self.assertFalse(self.terminal._requires_full_document_rebuild)
+
+    def test_wrapped_history_commands_do_not_retain_a_previous_command_suffix(self):
+        # Captured from Bash/readline while replacing the second command with
+        # the first at a 158-column terminal. The old command wraps to seven
+        # final cells; the replacement wraps to two, so a stale " main" tail
+        # used to be especially visible here.
+        first = (
+            "echo./redeploy.sh && git status && git add . && git commit -m "
+            "'filter parameter marker on HTMLJS graphs echo in customer facing site' "
+            "&& git push origin main"
+        )
+        second = (
+            "./redeploy.sh && git status && git add . && git commit -m "
+            "'CMS upgrades. Major upgrades to graph table import and line draw functionality' "
+            "&& git push origin main"
+        )
+        self.terminal._rebuild_screen(158, 5)
+        self.feed_now("user1@xps - $ " + second)
+        self.feed_now("\x1b[A\x08\x08\x08\x08" + first[:-1] + "\x1b[C\x1b[K")
+
+        rendered = [line.rstrip() for line in self.terminal.document().toPlainText().splitlines()[-5:]]
+        first_row_length = self.terminal.screen.columns - len("user1@xps - $ ")
+        self.assertEqual(rendered[:2], [
+            "user1@xps - $ " + first[:first_row_length],
+            first[first_row_length:],
+        ])
+        self.assertNotIn("main main", "\n".join(rendered))
+
+    def test_split_readline_delete_sequence_clears_wrapped_command_tail(self):
+        # Bash uses CSI 5 P here at the width shown in the reported terminal
+        # screenshot. Split it as an SSH/PTY read can: ESC[5 then P.
+        first = (
+            "echo./redeploy.sh && git status && git add . && git commit -m "
+            "'filter parameter marker on HTMLJS graphs echo in customer facing site' "
+            "&& git push origin main"
+        )
+        second = (
+            "./redeploy.sh && git status && git add . && git commit -m "
+            "'CMS upgrades. Major upgrades to graph table import and line draw functionality' "
+            "&& git push origin main"
+        )
+        prompt = "user1@xps - $ "
+        self.terminal._rebuild_screen(163, 5)
+        self.feed_now(prompt + second)
+        self.feed_now("\x1b[A\x1b[C" + first[:-3] + "\x1b[5")
+        self.feed_now("P" + "\x1b[C" * 7)
+
+        rendered = [line.rstrip() for line in self.terminal.document().toPlainText().splitlines()[-5:]]
+        split = self.terminal.screen.columns - len(prompt)
+        self.assertEqual(rendered[:2], [prompt + first[:split], first[split:]])
+        self.assertNotIn("main main", "\n".join(rendered))
+
+    def test_captured_windows_readline_delete_does_not_retain_wrapped_tail(self):
+        # Captured from the maximized Windows terminal. pyte previously left
+        # the final " main" of the older command after CSI 21 P shortened it.
+        first = (
+            "echo./redeploy.sh && git status && git add . && git commit -m "
+            "'filter parameter marker on HTMLJS graphs echo in customer facing site' "
+            "&& git push origin main"
+        )
+        second = (
+            "./redeploy.sh && git status && git add . && git commit -m "
+            "'CMS upgrades. Major upgrades to graph table import and line draw functionality' "
+            "&& git push origin main"
+        )
+        prompt = "                  "
+        self.terminal._rebuild_screen(167, 46)
+        self.feed_now(prompt + second)
+        self.feed_now(
+            "\x1b[A\r" + "\x1b[C" * len(prompt) + first[:83] + "\x1b[21P" + first[83:]
+        )
+
+        rendered = [line.rstrip() for line in self.terminal.document().toPlainText().splitlines()[-46:]]
+        first_row_length = self.terminal.screen.columns - len(prompt)
+        command_row = rendered.index(prompt + first[:first_row_length])
+        self.assertEqual(rendered[command_row:command_row + 2], [
+            prompt + first[:first_row_length],
+            first[first_row_length:],
+        ])
+        self.assertNotIn("main main", "\n".join(rendered))
+
+    def test_wrapped_history_redraw_keeps_the_existing_prompt_row(self):
+        prompt = " user1@xps  ~  $  "
+        styled_prompt = "\x1b[1;37;44m" + prompt + "\x1b[0m"
+        long_command = (
+            "./redeploy.sh && git status && git add . && git commit -m "
+            "'Added option to duplicate an object (product/series/product-type). Enhanced the CMS and made the pages better looking "
+            "but compatible with the capabilities of the CMS. Also added some features to the enquiry email functionality. More of this "
+            "to come soon-ish.' && git push origin main" + "                "
+        )
+        short_command = "cds Documents/fan_graphs_website"
+        self.terminal._rebuild_screen(167, 46)
+        self.terminal.screen.cursor.y = 37
+        self.feed_now(styled_prompt + short_command)
+        self.feed_now("\r" + "\x1b[C" * len(prompt) + long_command)
+        self.assertEqual(self.terminal.screen.cursor.y, 39)
+
+        self.feed_now(
+            "\x1b[A" * 3 + "\r" + "\x1b[C" * len(prompt) + "\x1b[50P" + short_command
+        )
+
+        rows = self.terminal.document().toPlainText().splitlines()[-46:]
+        self.assertEqual(rows[36].rstrip(), "")
+        row = rows[37].rstrip()
+        self.assertEqual(row, prompt + short_command)
 
     def test_small_interactive_output_is_not_artificially_delayed(self):
         self.assertEqual(self.terminal.interactive_render_delay_ms, 0)
