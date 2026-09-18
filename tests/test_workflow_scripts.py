@@ -146,6 +146,12 @@ class BuildEnvironmentTests(unittest.TestCase):
                 contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(build.choose_targets(dict.fromkeys(build.TARGETS)), ["windows"])
 
+    def test_version_menu_retries_invalid_msi_version(self):
+        build = load("build")
+        with patch("builtins.input", side_effect=["1.2", "1.2.3"]), \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(build.choose_version(["windows", "msi"]), "1.2.3")
+
     def test_windows_zip_is_self_contained_source_kit_without_repository_data(self):
         build = load("build")
         with tempfile.TemporaryDirectory() as folder, \

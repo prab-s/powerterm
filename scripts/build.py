@@ -23,6 +23,8 @@ DIST = ROOT / "dist"
 APP_ID = "io.github.prab_s.PowerTerm"
 TARGETS = ("windows", "linux", "appimage", "flatpak", "deb", "msi")
 MODULES = ("PyInstaller", "PySide6", "paramiko", "psutil", "pyte", "keyring")
+DEFAULT_VERSION = "0.1.0"
+PACKAGE_VERSION_RE = re.compile(r"[0-9][A-Za-z0-9.+~]*")
 
 
 def run(*args, **kwargs):
@@ -124,6 +126,29 @@ def choose_targets(available):
         if input("  Create these now? [y/N]: ").strip().lower() in ("y", "yes"):
             return selected
         print("Nothing started. Choose again, or enter 0 to finish.")
+
+
+def validate_package_version(version, selected):
+    if not PACKAGE_VERSION_RE.fullmatch(version):
+        raise ValueError("version must start with a digit and contain only letters, digits, '.', '+', or '~'")
+    if "msi" in selected:
+        windows_msi.validate_version(version)
+    return version
+
+
+def choose_version(selected):
+    section("Package version")
+    note("This version is used in package filenames and installer metadata.")
+    if "msi" in selected:
+        note("MSI requires major.minor.build, for example 0.1.1.")
+    else:
+        note("Example: 0.1.1. Press Enter to use 0.1.0.")
+    while True:
+        version = input(f"  Release version [{DEFAULT_VERSION}]: ").strip() or DEFAULT_VERSION
+        try:
+            return validate_package_version(version, selected)
+        except ValueError as exc:
+            print(exc)
 
 
 def windows_kit(work, version, target="windows"):
@@ -275,11 +300,9 @@ Description: PowerTerm terminal and SSH client
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("targets", nargs="*", help="target names or numbers, separated by spaces or commas; all selects every available choice")
-    parser.add_argument("--version", default="0.1.0", help="package version (default: 0.1.0)")
+    parser.add_argument("--version", help="package version; prompts when omitted")
     parser.add_argument("--flatpak-branch", default="25.08")
     args = parser.parse_args()
-    if not re.fullmatch(r"[0-9][A-Za-z0-9.+~]*", args.version):
-        parser.error("version must start with a digit and contain only letters, digits, '.', '+', or '~'")
     if not re.fullmatch(r"[A-Za-z0-9._-]+", args.flatpak_branch):
         parser.error("invalid Flatpak branch")
     for name in ("main.py", "powerterm.svg", "LICENSE", "requirements.txt"):
@@ -299,9 +322,11 @@ def main():
     if not selected:
         print("Finished without building.")
         return 0
-    if "msi" in selected:
+    if args.version is None:
+        args.version = choose_version(selected)
+    else:
         try:
-            windows_msi.validate_version(args.version)
+            validate_package_version(args.version, selected)
         except ValueError as exc:
             parser.error(str(exc))
     if "flatpak" in selected:

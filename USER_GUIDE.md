@@ -515,9 +515,12 @@ numbered menu shows each option and its availability:
 6. Windows MSI installer (on Windows) or MSI build ZIP (on Linux)
 
 Enter one number, several separated by commas (for example `1,2,5`), or `A` for
-all available choices. Review the selection and answer `y` to start. Enter `0`
-or press Enter at the selection prompt to finish without building. Invalid or
-unavailable selections explain the problem and let you choose again.
+all available choices. Review the selection and answer `y` to continue. The
+script then asks for the release version used in package filenames and metadata;
+press Enter to use `0.1.0`. MSI builds require a three-part version such as
+`0.1.1`. Enter `0` or press Enter at the selection prompt to finish without
+building. Invalid or unavailable selections explain the problem and let you
+choose again.
 
 For direct commands, names and numbers work, including multiple targets:
 
@@ -544,8 +547,9 @@ SDKs, install packages into the system, or publish artifacts.
 | `deb` | `powerterm_VERSION_ARCH.deb` | Linux, Python build dependencies, `dpkg` and `dpkg-deb` |
 | `flatpak` | `PowerTerm-VERSION-ARCH.flatpak` | Linux, `flatpak`, Freedesktop SDK and Platform, network access for Python dependencies |
 
-The default package version is `0.1.0`; pass `--version` for releases. This is
-packaging metadata, not a change to the app. Temporary build files go under
+The build menu offers `0.1.0` as its default package version; pass `--version`
+to use a specific value without being prompted. This is packaging metadata, not
+a change to the app. Temporary build files go under
 `build/`; successful artifacts replace matching filenames in `dist/`. Old
 artifacts from previous runs remain, so check the `OK`/`FAILED` build results.
 
