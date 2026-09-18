@@ -489,7 +489,7 @@ This creates `dist/PowerTerm-0.1.0-windows-build-kit.zip`. Copy/download it to
 Windows, extract the entire ZIP, then double-click **BUILD-WINDOWS.bat**. Install
 Python 3.11+ with pip and the Python launcher on Windows first; internet access is
 needed for dependencies. The launcher creates a Windows virtual environment,
-installs the requirements and builds `dist/PowerTerm-Portable.exe`. It pauses on completion
+installs the requirements and builds `dist/PowerTerm-VERSION-Portable.exe`. It pauses on completion
 or failure so the output remains visible. `START-HERE.txt` contains instructions.
 
 The ZIP includes application source, icon, original licence, requirements and the
@@ -539,7 +539,7 @@ SDKs, install packages into the system, or publish artifacts.
 | Target | Output in `dist/` | Requirements |
 | --- | --- | --- |
 | `windows` on Linux | `PowerTerm-VERSION-windows-build-kit.zip` | Python and the project files |
-| `windows` on Windows | `PowerTerm-Portable.exe` | Windows, application dependencies and PyInstaller (installed by the Windows launcher) |
+| `windows` on Windows | `PowerTerm-VERSION-Portable.exe` | Windows, application dependencies and PyInstaller (installed by the Windows launcher) |
 | `msi` on Linux | `PowerTerm-VERSION-windows-msi-build-kit.zip` | Python and the project files |
 | `msi` on Windows | `PowerTerm-VERSION-ARCH.msi` | Windows, Python build dependencies, WiX 4.0.6 and matching UI extension |
 | `linux` | `PowerTerm-VERSION-ARCH` | Linux, application dependencies and PyInstaller |

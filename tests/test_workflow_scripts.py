@@ -286,7 +286,7 @@ class WindowsInstallerTests(unittest.TestCase):
                 build.package("windows", work, "0.1.0", "25.08", {})
                 self.assertTrue(freeze.call_args.args[1])
             with patch.object(build.platform, "system", return_value="Windows"), patch.object(build, "run"):
-                self.assertEqual(build.freeze(work, True).name, "PowerTerm-Portable.exe")
+                self.assertEqual(build.freeze(work, True, "1.2.3").name, "PowerTerm-1.2.3-Portable.exe")
                 self.assertEqual(build.freeze(work, False).name, "PowerTerm")
 
     def test_linux_msi_kit_selects_msi_on_windows(self):

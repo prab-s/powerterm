@@ -1,6 +1,6 @@
 # Windows Portable and MSI builds
 
-The Portable build is `dist/PowerTerm-Portable.exe`. It runs without installation
+The Portable build is `dist/PowerTerm-VERSION-Portable.exe`. It runs without installation
 and retains PyInstaller's single-file extraction at launch. "Portable" describes
 the executable packaging; settings still use PowerTerm's normal per-user location.
 

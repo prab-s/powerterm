@@ -171,7 +171,7 @@ def windows_kit(work, version, target="windows"):
 2. Extract the ENTIRE ZIP to a writable folder (do not run inside the ZIP).
 3. Double-click BUILD-WINDOWS.bat.
 4. Wait for dependency installation and the PyInstaller build to finish.
-5. Output is in dist: PowerTerm-Portable.exe or PowerTerm-VERSION-ARCH.msi.
+5. Output is in dist: PowerTerm-VERSION-Portable.exe or PowerTerm-VERSION-ARCH.msi.
 
 For the MSI kit, first follow WINDOWS-MSI.md to install WiX and its UI extension.
 The MSI installs a directory build; the portable EXE remains a single-file build.
@@ -192,7 +192,7 @@ source available when distributing the executable.
 def freeze(work, onefile, version=DEFAULT_VERSION):
     name = "PowerTerm" if platform.system() == "Windows" else "powerterm"
     if platform.system() == "Windows" and onefile:
-        name = "PowerTerm-Portable"
+        name = f"PowerTerm-{version}-Portable"
     mode = "onefile" if onefile else "onedir"
     out = work / mode
     version_file = work / "PACKAGE-VERSION.txt"
