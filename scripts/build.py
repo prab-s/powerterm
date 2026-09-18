@@ -259,8 +259,12 @@ def package(target, work, version, branch, frozen):
     binary = frozen[onefile]
     if target == "msi":
         return windows_msi.build_msi(binary, work, version, ROOT / "LICENSE")
-    if onefile:
+    if target == "windows":
         return binary
+    if target == "linux":
+        output = work / f"PowerTerm-{version}-{platform.machine()}"
+        shutil.copy2(binary, output)
+        return output
     if target == "appimage":
         appdir = work / "PowerTerm.AppDir"
         shutil.copytree(binary, appdir / "usr/lib/powerterm")

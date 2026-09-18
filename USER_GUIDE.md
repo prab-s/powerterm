@@ -542,7 +542,7 @@ SDKs, install packages into the system, or publish artifacts.
 | `windows` on Windows | `PowerTerm-Portable.exe` | Windows, application dependencies and PyInstaller (installed by the Windows launcher) |
 | `msi` on Linux | `PowerTerm-VERSION-windows-msi-build-kit.zip` | Python and the project files |
 | `msi` on Windows | `PowerTerm-VERSION-ARCH.msi` | Windows, Python build dependencies, WiX 4.0.6 and matching UI extension |
-| `linux` | `powerterm` | Linux, application dependencies and PyInstaller |
+| `linux` | `PowerTerm-VERSION-ARCH` | Linux, application dependencies and PyInstaller |
 | `appimage` | `PowerTerm-VERSION-ARCH.AppImage` | Linux, Python build dependencies and `appimagetool` on PATH |
 | `deb` | `powerterm_VERSION_ARCH.deb` | Linux, Python build dependencies, `dpkg` and `dpkg-deb` |
 | `flatpak` | `PowerTerm-VERSION-ARCH.flatpak` | Linux, `flatpak`, Freedesktop SDK and Platform, network access for Python dependencies |

@@ -169,6 +169,17 @@ class BuildEnvironmentTests(unittest.TestCase):
                 self.assertEqual(archive.read(prefix + "LICENSE"), (SCRIPTS.parent / "LICENSE").read_bytes())
                 self.assertEqual(archive.read(prefix + "PACKAGE-VERSION.txt"), b"1.2.3\n")
 
+    def test_linux_standalone_artifact_includes_the_release_version(self):
+        build = load("build")
+        with tempfile.TemporaryDirectory() as folder, \
+                patch.object(build.platform, "system", return_value="Linux"), \
+                patch.object(build.platform, "machine", return_value="x86_64"):
+            binary = Path(folder) / "powerterm"
+            binary.write_text("fixture executable\n")
+            output = build.package("linux", Path(folder), "1.2.3", "25.08", {True: binary})
+            self.assertEqual(output.name, "PowerTerm-1.2.3-x86_64")
+            self.assertEqual(output.read_text(), "fixture executable\n")
+
 
 class CombinedWorkflowTests(unittest.TestCase):
     def setUp(self):
