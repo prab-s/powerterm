@@ -55,8 +55,28 @@ def main():
     git("status", "--short", "--branch", "--untracked-files=all")
     # Refresh only the expected branch; reject divergence before changing the index.
     git("fetch", "--no-tags", "origin", "refs/heads/main")
-    if subprocess.run(["git", "merge-base", "--is-ancestor", "FETCH_HEAD", "HEAD"], cwd=ROOT).returncode:
-        raise RuntimeError("Local main is behind or diverged from origin/main. Reconcile it manually first.")
+    counts = git("rev-list", "--left-right", "--count", "HEAD...FETCH_HEAD", capture=True).split()
+    local_ahead, remote_ahead = (int(value) for value in counts)
+    if remote_ahead:
+        section("GitHub | Remote updates available")
+        note(f"origin/main has {remote_ahead} commit(s) not in local main.")
+        if local_ahead:
+            note(f"Local main also has {local_ahead} unpublished commit(s), which will be rebased.")
+        note("Updating uses git pull --rebase --autostash. It never force-pushes.")
+        while True:
+            option("1", "Update local main, then continue")
+            option("0", "Cancel")
+            choice = input("  Your choice [0]: ").strip().lower()
+            if choice in ("1", "y", "yes"):
+                break
+            if choice in ("", "0", "n", "no", "q"):
+                print("Cancelled; nothing staged, committed, or pushed.")
+                return 2
+            print("Choose 1 to update local main or 0 to cancel.")
+        git("pull", "--rebase", "--autostash", "origin", "main")
+        git("fetch", "--no-tags", "origin", "refs/heads/main")
+        if subprocess.run(["git", "merge-base", "--is-ancestor", "FETCH_HEAD", "HEAD"], cwd=ROOT).returncode:
+            raise RuntimeError("Could not update local main cleanly. Resolve the Git operation, then rerun the workflow.")
     dirty = bool(git("status", "--porcelain", "--untracked-files=all", capture=True))
     section("Existing commits waiting to be pushed")
     outgoing = git("log", "--oneline", "FETCH_HEAD..HEAD", capture=True).strip()

@@ -99,16 +99,17 @@ class PushSafetyTests(unittest.TestCase):
         with self.assertRaises(subprocess.CalledProcessError):
             self.invoke()
 
-    def test_remote_ahead_is_rejected_before_staging(self):
+    def test_remote_ahead_can_be_rebased_before_staging(self):
         (self.repo / "remote-change").write_text("remote\n")
         self.command("add", ".")
         self.command("commit", "-m", "Remote update")
         self.command("push", "origin", "main")
         self.command("reset", "--hard", "HEAD~1")
         (self.repo / "local-change").write_text("local\n")
-        with self.assertRaisesRegex(RuntimeError, "behind or diverged"):
-            self.invoke()
-        self.assertEqual(self.command("diff", "--cached"), "")
+        self.invoke()
+        self.assertTrue((self.repo / "remote-change").exists())
+        self.assertTrue((self.repo / "local-change").exists())
+        self.assertEqual(self.command("ls-remote", "origin", "main").split()[0], self.command("rev-parse", "HEAD"))
 
 
 class BuildEnvironmentTests(unittest.TestCase):
