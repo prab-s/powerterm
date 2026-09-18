@@ -30,6 +30,11 @@ where available; they are not stored in that JSON file.
 
 ## Getting started
 
+**Linux and Windows binaries are available in the releases (RECOMMENDED)** 
+
+---
+
+Otherwise...
 To run from source, clone or download this repository and open a terminal in its
 folder. Use Python 3.11 or newer.
 
