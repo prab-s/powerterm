@@ -834,13 +834,14 @@ class TerminalWidget(QPlainTextEdit):
         self._private_startup_buffer = None
         self._private_startup_generation = 0
         self._rendered_rows = None
+        self._rendered_history_count = 0
+        self._rendered_history_first = None
         self._requires_full_document_rebuild = False
         self._redraw_control_tail = ""
         # pyte models DCH per physical row, while readline uses it to redraw
         # wrapped logical input. Keep any compatibility correction out of the
         # emulator and apply it only to a copied render snapshot.
         self._readline_overlay = {}
-        self._active_readline_overlay_keys = set()
         self._pending_readline_prompt = None
         self._virtual_readline_prompt = None
         self._last_bell_time = 0.0
@@ -1007,6 +1008,8 @@ class TerminalWidget(QPlainTextEdit):
             self.screen = new_screen
             self.stream = new_stream
             self._rendered_rows = None
+            self._rendered_history_count = 0
+            self._rendered_history_first = None
             self._history_offset = 0
             self._history_scrolled = False
             self._clear_readline_overlay()
@@ -1038,15 +1041,8 @@ class TerminalWidget(QPlainTextEdit):
 
     def _clear_readline_overlay(self):
         self._readline_overlay = {}
-        self._active_readline_overlay_keys = set()
         self._pending_readline_prompt = None
         self._virtual_readline_prompt = None
-
-    def _discard_active_readline_overlay(self):
-        """Remove corrections for the editable command Bash is replacing."""
-        for key in self._active_readline_overlay_keys:
-            self._readline_overlay.pop(key, None)
-        self._active_readline_overlay_keys.clear()
 
     def _apply_readline_overlay(self, visible_lines):
         """Apply readline's wrapped-redraw correction to copied screen cells.
@@ -1122,6 +1118,8 @@ class TerminalWidget(QPlainTextEdit):
         self._backend_geometry_needs_sync = False
         self.clear()
         self._rendered_rows = None
+        self._rendered_history_count = 0
+        self._rendered_history_first = None
         self._send_resize()
 
     def set_backend(self, backend, reset=True):
@@ -1248,11 +1246,6 @@ class TerminalWidget(QPlainTextEdit):
             self._virtual_readline_prompt = None
         self._record_replay(text)
         self.stream.feed(text)
-        if not has_delete and redraw_target is not None:
-            # Keep only the old shortened-tail cells that are outside the new
-            # history entry. Dropping the whole patch creates stale suffixes;
-            # retaining all of it creates gaps through the new command.
-            self._refresh_active_readline_overlay(redraw_target)
         # Readline/PSReadLine compactly redraw history entries using cursor
         # movement followed by erase/delete controls. The logical screen is
         # correct in pyte, but explicitly invalidate Qt's document after these
@@ -1262,6 +1255,7 @@ class TerminalWidget(QPlainTextEdit):
         # recognised even when their bytes arrive in separate callbacks.
         self._requires_full_document_rebuild |= bool(self.REDRAW_ERASE_RE.search(redraw_probe))
         if has_delete:
+            self._clear_shortened_readline_tail(previous_cursor)
             self._set_readline_overlay(
                 previous_cursor, text,
                 prompt_snapshot or self._pending_readline_prompt,
@@ -1269,20 +1263,24 @@ class TerminalWidget(QPlainTextEdit):
             self._pending_readline_prompt = None
         elif "\n" in text and redraw_target is None:
             # Command output has made the current input part of the terminal
-            # transcript. Keep its display correction, but no longer treat it
-            # as an editable row that a later history redraw can replace.
-            self._active_readline_overlay_keys.clear()
+            # transcript, so an old prompt snapshot cannot be reused later.
+            self._virtual_readline_prompt = None
         self._redraw_control_tail = redraw_probe[-32:]
         # Readline redraws are latency-sensitive: Ctrl-R, completion cycling,
         # and cursor movement arrive as control sequences and must be visible
         # in the next GUI turn. Ordinary output remains coalesced briefly.
-        interactive_redraw = "\x1b" in text or "\x12" in text
-        small_interactive_output = len(text) <= 256
-        if interactive_redraw or small_interactive_output:
+        interactive_redraw = (
+            bool(self.REDRAW_ERASE_RE.search(redraw_probe))
+            or redraw_target is not None
+            or "\x12" in text
+        )
+        if interactive_redraw:
             self.render_screen()
         elif not self._render_pending:
             self._render_pending = True
-            QTimer.singleShot(6, self.render_screen)
+            # Coalesce ordinary command output. Rendering every small SSH
+            # packet makes a busy terminal monopolise the Qt event loop.
+            QTimer.singleShot(16, self.render_screen)
 
     @staticmethod
     def _readline_motion_count(sequence, direction):
@@ -1332,29 +1330,15 @@ class TerminalWidget(QPlainTextEdit):
         return None
 
     def _set_readline_overlay(self, previous_cursor, text, prompt_snapshot):
-        """Correct a readline redraw without changing pyte's screen state."""
-        self._discard_active_readline_overlay()
-        old_x, old_y = previous_cursor
-        new_x, new_y = self.screen.cursor.x, self.screen.cursor.y
-        columns, lines = int(self.screen.columns), int(self.screen.lines)
-        old_x, new_x = max(0, min(columns, int(old_x))), max(0, min(columns, int(new_x)))
-        old_y, new_y = max(0, min(lines - 1, int(old_y))), max(0, min(lines - 1, int(new_y)))
-        # Store document row numbers, rather than live-screen rows. When the
-        # shell prints a result, the corrected command line may move into
-        # pyte's history; its display-only cleared tail must move with it.
-        history_rows = max(0, len(self._history_snapshot()) - lines)
-        overlay = dict(self._readline_overlay)
-        active_keys = set()
-        default_cell = getattr(self.screen, "default_char", None)
-        if default_cell is not None and (new_y, new_x) < (old_y, old_x):
-            for y in range(new_y, old_y + 1):
-                start = new_x if y == new_y else 0
-                end = old_x if y == old_y else columns
-                for x in range(start, end):
-                    key = (history_rows + y, x)
-                    overlay[key] = default_cell
-                    active_keys.add(key)
+        """Keep a styled prompt at readline's intended display row.
 
+        Tail cleanup is applied to pyte itself. Keeping it out of this
+        renderer overlay prevents one recalled command from masking text in a
+        later recalled command.
+        """
+        columns, lines = int(self.screen.columns), int(self.screen.lines)
+        history_rows = max(0, len(self._history_snapshot()) - lines)
+        overlay = {}
         if prompt_snapshot is None and self._virtual_readline_prompt is not None:
             target = self._readline_redraw_target(text, previous_cursor)
             if target is not None:
@@ -1367,29 +1351,26 @@ class TerminalWidget(QPlainTextEdit):
                 self._virtual_readline_prompt = (prompt_y, tuple(prompt_cells))
 
         self._readline_overlay = overlay
-        self._active_readline_overlay_keys = active_keys
         self._requires_full_document_rebuild = True
 
-    def _refresh_active_readline_overlay(self, redraw_target):
-        """Let a replacement history entry paint over its predecessor's tail."""
-        if not self._active_readline_overlay_keys:
+    def _clear_shortened_readline_tail(self, previous_cursor):
+        """Clear pyte cells that readline has removed across wrapped rows."""
+        old_x, old_y = previous_cursor
+        new_x, new_y = int(self.screen.cursor.x), int(self.screen.cursor.y)
+        columns, lines = int(self.screen.columns), int(self.screen.lines)
+        old_x, new_x = max(0, min(columns, int(old_x))), max(0, min(columns, new_x))
+        old_y, new_y = max(0, min(lines - 1, int(old_y))), max(0, min(lines - 1, int(new_y)))
+        if (new_y, new_x) >= (old_y, old_x):
             return
-        start_y, start_x = redraw_target
-        end_y, end_x = int(self.screen.cursor.y), int(self.screen.cursor.x)
-        history_rows = max(0, len(self._history_snapshot()) - int(self.screen.lines))
-        if not (0 <= start_y < self.screen.lines and 0 <= end_y < self.screen.lines):
+        default_cell = getattr(self.screen, "default_char", None)
+        if default_cell is None:
             return
-        if (end_y, end_x) < (start_y, start_x):
-            return
-        retained = set()
-        for key in self._active_readline_overlay_keys:
-            row, x = key
-            y = row - history_rows
-            if (y, x) < (start_y, start_x) or (y, x) >= (end_y, end_x):
-                retained.add(key)
-                continue
-            self._readline_overlay.pop(key, None)
-        self._active_readline_overlay_keys = retained
+        for y in range(new_y, old_y + 1):
+            start = new_x if y == new_y else 0
+            end = old_x if y == old_y else columns
+            line = self.screen.buffer[y]
+            for x in range(start, end):
+                line[x] = default_cell
         self._requires_full_document_rebuild = True
 
     @staticmethod
@@ -1485,17 +1466,63 @@ class TerminalWidget(QPlainTextEdit):
         # Unlike a rolling one-page canvas, this gives every displayed line a
         # stable document position, so Qt can preserve a multi-line selection
         # while the user scrolls through it.
-        visible_lines = self._apply_readline_overlay(self._history_snapshot())
+        history = getattr(self.screen, "history", None)
+        history_lines = list(history.top) if history is not None else []
+        history_count = len(history_lines)
+        history_first = history_lines[0] if history_lines else None
+        lines = int(self.screen.lines)
+        columns = int(self.screen.columns)
+        # When a terminal scrolls, its previous top screen row becomes the
+        # next history row and every other document row keeps its position.
+        # Update only pyte's dirty live rows instead of rebuilding and styling
+        # all 10,000 history rows for each output packet.
+        incremental = (
+            self._rendered_rows is not None
+            and not self._requires_full_document_rebuild
+            and not self._readline_overlay
+            and history_count >= self._rendered_history_count
+            and (self._rendered_history_count == 0 or history_first is self._rendered_history_first)
+            and len(self._rendered_rows) == self._rendered_history_count + lines
+        )
+        visible_lines = None
+        if incremental:
+            rows = list(self._rendered_rows)
+            added_history = history_count - self._rendered_history_count
+            if added_history:
+                rows.extend([None] * added_history)
+                cursor = QTextCursor(self.document())
+                cursor.movePosition(QTextCursor.MoveOperation.End)
+                cursor.insertText("\n" + "\n".join(" " * columns for _ in range(added_history)))
+            dirty_rows = set(getattr(self.screen, "dirty", set()))
+            if added_history:
+                dirty_rows.update(range(max(0, lines - added_history), lines))
+            changed = []
+            for live_y in dirty_rows:
+                if not 0 <= live_y < lines:
+                    continue
+                line = self._copy_terminal_line(self.screen.buffer[live_y])
+                default_cell = getattr(self.screen, "default_char", None)
+                row = tuple((cell.data if cell is not None else " ",
+                             self._cell_style_key(cell) if cell is not None else None)
+                            for cell in (line.get(x, default_cell) for x in range(columns)))
+                index = history_count + live_y
+                if rows[index] != row:
+                    rows[index] = row
+                    changed.append(index)
+        else:
+            visible_lines = self._apply_readline_overlay(self._history_snapshot())
+            rows = None
 
         self.setUpdatesEnabled(False)
         try:
             default_cell = getattr(self.screen, "default_char", None)
-            rows = []
-            for line in visible_lines:
-                cells = [line.get(x, default_cell) for x in range(self.screen.columns)]
-                rows.append(tuple((cell.data if cell is not None else " ",
-                                   self._cell_style_key(cell) if cell is not None else None)
-                                  for cell in cells))
+            if not incremental:
+                rows = []
+                for line in visible_lines:
+                    cells = [line.get(x, default_cell) for x in range(columns)]
+                    rows.append(tuple((cell.data if cell is not None else " ",
+                                       self._cell_style_key(cell) if cell is not None else None)
+                                      for cell in cells))
 
             # Establish a fixed-size document once. Subsequent redraws update
             # only changed blocks, which is dramatically cheaper for readline
@@ -1505,16 +1532,23 @@ class TerminalWidget(QPlainTextEdit):
             # state in that case: it is more reliable than several in-place
             # block replacements, which can leave a stale suffix painted after
             # a shorter history entry replaces a longer one.
-            if (self._requires_full_document_rebuild or self._rendered_rows is None
-                    or len(self._rendered_rows) != len(rows)):
+            if (not incremental and (self._requires_full_document_rebuild or self._rendered_rows is None
+                    or len(self._rendered_rows) != len(rows))):
                 plain = "\n".join("".join(cell[0] or " " for cell in row) for row in rows)
                 self.setPlainText(plain)
                 changed = range(len(rows))
-            else:
+                # Applying a QTextCharFormat run-by-run to thousands of old
+                # history rows blocks the Qt event loop. Keep the transcript
+                # immediately readable, then reserve rich ANSI/semantic
+                # formatting for the live terminal and recent scrollback.
+                if len(rows) > 500:
+                    changed = range(max(0, len(rows) - max(200, self.screen.lines * 3)), len(rows))
+            elif not incremental:
                 changed = [i for i, row in enumerate(rows) if row != self._rendered_rows[i]]
 
             for y in changed:
-                line = visible_lines[y]
+                line = (visible_lines[y] if visible_lines is not None
+                        else self._copy_terminal_line(self.screen.buffer[y - history_count]))
                 block = self.document().findBlockByNumber(y)
                 if not block.isValid():
                     continue
@@ -1528,7 +1562,7 @@ class TerminalWidget(QPlainTextEdit):
                 run_text = []
                 run_cell = None
                 run_key = None
-                for x in range(self.screen.columns):
+                for x in range(columns):
                     cell = line.get(x, default_cell)
                     if cell is None:
                         continue
@@ -1545,6 +1579,12 @@ class TerminalWidget(QPlainTextEdit):
                 cursor.endEditBlock()
 
             self._rendered_rows = rows
+            self._rendered_history_count = history_count
+            self._rendered_history_first = history_first
+            try:
+                self.screen.dirty.clear()
+            except Exception:
+                pass
         finally:
             self.setUpdatesEnabled(True)
 
@@ -1732,11 +1772,14 @@ class TerminalWidget(QPlainTextEdit):
 
         old_size = (self.screen.columns, self.screen.lines)
         if size != old_size:
-            # Tell the actual PTY first so interactive programs can redraw for
-            # the new geometry. Then rebuild pyte from the output journal rather
-            # than calling Screen.resize(), which clips existing cells.
+            # A terminal resize changes the live screen; it does not replay an
+            # entire session. Replaying the raw journal on every maximize or
+            # restore reinterpreted old wrapping at the new width, produced
+            # redraw artefacts, and could block the GUI for seconds.
             self._resize_backend(cols, rows)
-            self._rebuild_screen(cols, rows)
+            self.screen.resize(lines=rows, columns=cols)
+            self._rendered_rows = None
+            self._clear_readline_overlay()
             self.render_screen()
         else:
             self._resize_backend(cols, rows)

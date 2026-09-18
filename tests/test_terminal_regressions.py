@@ -106,6 +106,13 @@ class TerminalRegressionTests(unittest.TestCase):
         self.terminal._rebuild_screen(167, 46)
         self.assertEqual((self.terminal.screen.cursor.x, self.terminal.screen.cursor.y), (0, 0))
 
+    def test_widget_resize_does_not_replay_the_terminal_journal(self):
+        self.feed_now("previous terminal output\r\n")
+        self.terminal.screen.resize(lines=5, columns=20)
+        self.terminal._last_terminal_size = None
+        self.terminal._rebuild_screen = lambda *_args, **_kwargs: self.fail("resize must not replay terminal output")
+        self.terminal._apply_terminal_resize()
+
     def test_new_backend_receives_resize_when_terminal_was_already_laid_out(self):
         class Backend:
             def __init__(self):
