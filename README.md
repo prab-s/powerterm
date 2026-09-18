@@ -10,6 +10,7 @@ Work with local and remote shells, browse files beside your terminal, and keep h
 and frequently used commands close at hand.
 
 PowerTerm is a terminal and SSH client for Linux and Windows, written in Python/PySide6 with a lot of help from Codex.
+
 It's kind of like MobaXterm, but cross platform, and FOSS.
 
 ---
