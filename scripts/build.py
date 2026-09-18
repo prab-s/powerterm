@@ -189,17 +189,20 @@ source available when distributing the executable.
     return output
 
 
-def freeze(work, onefile):
+def freeze(work, onefile, version=DEFAULT_VERSION):
     name = "PowerTerm" if platform.system() == "Windows" else "powerterm"
     if platform.system() == "Windows" and onefile:
         name = "PowerTerm-Portable"
     mode = "onefile" if onefile else "onedir"
     out = work / mode
+    version_file = work / "PACKAGE-VERSION.txt"
+    write(version_file, version + "\n")
     args = [sys.executable, "-m", "PyInstaller", "--noconfirm", "--clean",
             f"--{mode}", "--name", name, "--distpath", out,
             "--workpath", work / f"{mode}-work", "--specpath", work,
             "--add-data", f"{ROOT / 'powerterm.svg'}{os.pathsep}.",
             "--add-data", f"{ROOT / 'LICENSE'}{os.pathsep}.",
+            "--add-data", f"{version_file}{os.pathsep}.",
             "--collect-all", "keyring"]
     if platform.system() == "Windows":
         args += ["--windowed", "--collect-all", "winpty"]
@@ -217,6 +220,7 @@ def build_flatpak(work, version, branch):
     source.mkdir(parents=True)
     for name in ("main.py", "powerterm.svg", "LICENSE", "requirements.txt"):
         shutil.copy2(ROOT / name, source / name)
+    write(source / "PACKAGE-VERSION.txt", version + "\n")
     write(source / "build.sh", """#!/bin/sh
 set -eu
 cd /app/src
@@ -224,7 +228,7 @@ python3 -m pip install --target=/app/build-deps -r requirements.txt 'PyInstaller
 export PYTHONPATH=/app/build-deps
 python3 -m PyInstaller --noconfirm --clean --onedir --name powerterm \\
     --distpath /app/lib --workpath /app/work --specpath /app/work \\
-    --add-data powerterm.svg:. --add-data LICENSE:. --collect-all keyring main.py
+    --add-data powerterm.svg:. --add-data LICENSE:. --add-data PACKAGE-VERSION.txt:. --collect-all keyring main.py
 """)
     run("flatpak", "build", "--share=network", stage, "sh", "/app/src/build.sh")
     for name in ("build-deps", "src", "work"):
@@ -255,7 +259,7 @@ def package(target, work, version, branch, frozen):
         return build_flatpak(work, version, branch)
     onefile = target in ("linux", "windows")
     if onefile not in frozen:
-        frozen[onefile] = freeze(work, onefile)
+        frozen[onefile] = freeze(work, onefile, version)
     binary = frozen[onefile]
     if target == "msi":
         return windows_msi.build_msi(binary, work, version, ROOT / "LICENSE")

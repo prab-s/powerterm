@@ -7,7 +7,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PySide6.QtWidgets import QApplication, QAbstractItemView, QTreeWidgetItem
 from PySide6.QtCore import Qt
 
-from main import MainWindow, PermissionsDialog, RemoteFileLoader, RemoteFileTree, SshBackend, TerminalWidget, bash_cwd_hook_command, bash_private_command, file_fingerprint, prune_nested_delete_targets, should_auto_connect_saved_password, ssh_auth_probe_options
+from main import APP_VERSION, MainWindow, PermissionsDialog, RemoteFileLoader, RemoteFileTree, SshBackend, TerminalWidget, bash_cwd_hook_command, bash_private_command, file_fingerprint, prune_nested_delete_targets, should_auto_connect_saved_password, ssh_auth_probe_options
 
 
 class TerminalRegressionTests(unittest.TestCase):
@@ -156,6 +156,15 @@ class TerminalRegressionTests(unittest.TestCase):
 
         self.assertEqual(backend.sizes, [displayed_size])
 
+    def test_ssh_pty_uses_the_measured_size_before_connection_starts(self):
+        backend = SshBackend("example.invalid", 22, "tester", "", autostart=False)
+        try:
+            backend.resize(167, 46)
+            self.assertEqual(backend._pty_size, (167, 46))
+            self.assertFalse(backend._started)
+        finally:
+            backend.close()
+
     def test_terminal_input_contract_for_ctrl_r_and_tab(self):
         class Backend:
             def __init__(self):
@@ -297,6 +306,14 @@ class TerminalRegressionTests(unittest.TestCase):
         self.assertTrue(all(not row.strip() for row in rows[1:]))
         self.assertFalse(self.terminal._requires_full_document_rebuild)
 
+        # Once a command is executed, its corrected input rows become
+        # scrollback. The renderer must retain the correction there without
+        # writing into pyte's history buffer.
+        self.feed_now("result\r\n" * 5)
+        rendered = self.terminal.document().toPlainText()
+        self.assertIn("P> echo short", rendered)
+        self.assertNotIn("short-command", rendered)
+
     def test_wrapped_history_commands_do_not_retain_a_previous_command_suffix(self):
         # Captured from Bash/readline while replacing the second command with
         # the first at a 158-column terminal. The old command wraps to seven
@@ -392,15 +409,29 @@ class TerminalRegressionTests(unittest.TestCase):
         self.feed_now(styled_prompt + short_command)
         self.feed_now("\r" + "\x1b[C" * len(prompt) + long_command)
         self.assertEqual(self.terminal.screen.cursor.y, 39)
+        history_before = [dict(line) for line in self.terminal.screen.history.top]
 
         self.feed_now(
             "\x1b[A" * 3 + "\r" + "\x1b[C" * len(prompt) + "\x1b[50P" + short_command
         )
 
         rows = self.terminal.document().toPlainText().splitlines()[-46:]
-        self.assertEqual(rows[36].rstrip(), "")
-        row = rows[37].rstrip()
+        # Bash targets row 36. The renderer corrects that view without
+        # rewriting the escape sequence or mutating pyte's scrollback.
+        row = rows[36].rstrip()
         self.assertEqual(row, prompt + short_command)
+        self.assertEqual(rows[37].rstrip(), "")
+        self.assertEqual([dict(line) for line in self.terminal.screen.history.top], history_before)
+
+        # A following history entry can reuse the cells that were blanked
+        # while shortening the previous one. Its text must not inherit gaps
+        # from that temporary correction.
+        self.feed_now("\r" + "\x1b[C" * len(prompt) + long_command)
+        rows = self.terminal.document().toPlainText().splitlines()[-46:]
+        first_width = self.terminal.screen.columns - len(prompt)
+        self.assertEqual(rows[36].rstrip(), prompt + long_command[:first_width])
+        self.assertEqual(rows[37].rstrip(), long_command[first_width:first_width + self.terminal.screen.columns])
+        self.assertEqual(rows[38].rstrip(), long_command[first_width + self.terminal.screen.columns:].rstrip())
 
     def test_small_interactive_output_is_not_artificially_delayed(self):
         self.assertEqual(self.terminal.interactive_render_delay_ms, 0)
@@ -680,6 +711,10 @@ class TerminalRegressionTests(unittest.TestCase):
                 window.transfer_button,
                 window.remote_file_toolbar.findChildren(type(window.transfer_button)),
             )
+            self.assertTrue(hasattr(window, "action_about"))
+            self.assertEqual(window.action_about.text(), "About and\nUpdates")
+            self.assertTrue(window._release_is_newer("v0.1.1"))
+            self.assertFalse(window._release_is_newer(APP_VERSION))
             menu = window.build_file_menu("C:/tmp/example.txt", False, False)
             self.assertIn("Open in Default Application", [action.text() for action in menu.actions()])
         finally:

@@ -20,7 +20,9 @@ import queue
 from datetime import datetime
 from collections import deque
 from pathlib import Path
+from urllib.error import URLError
 from urllib.parse import unquote, urlparse
+from urllib.request import Request, urlopen
 
 import paramiko
 import psutil
@@ -39,6 +41,27 @@ from PySide6.QtWidgets import (
 
 
 ANSI_ESCAPE_RE = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
+GITHUB_LATEST_RELEASE_URL = "https://api.github.com/repos/prab-s/powerterm/releases/latest"
+GITHUB_RELEASES_URL = "https://github.com/prab-s/powerterm/releases"
+
+
+def application_version():
+    """Read packaging metadata when present, with a source-tree fallback."""
+    roots = [Path(__file__).resolve().parent]
+    bundle_root = getattr(sys, "_MEIPASS", None)
+    if bundle_root:
+        roots.insert(0, Path(bundle_root))
+    for root in roots:
+        try:
+            value = (root / "PACKAGE-VERSION.txt").read_text(encoding="utf-8").strip()
+            if value:
+                return value
+        except OSError:
+            pass
+    return "0.1.0"
+
+
+APP_VERSION = application_version()
 
 def strip_ansi(text: str) -> str:
     """Remove ANSI/VT escape sequences from captured command output."""
@@ -385,7 +408,7 @@ class SshBackend(TerminalBackend):
     # poll short enough that Bash echo/readline redraws do not feel key-bound.
     ssh_poll_interval = 0.002
 
-    def __init__(self, host, port, username, password, parent=None):
+    def __init__(self, host, port, username, password, parent=None, autostart=True):
         super().__init__(parent)
         self.host = host
         self.port = port
@@ -395,6 +418,16 @@ class SshBackend(TerminalBackend):
         self.channel = None
         self._alive = True
         self._shell_ready = False
+        self._started = False
+        self._pty_size = (100, 30)
+        if autostart:
+            self.start()
+
+    def start(self):
+        """Open the SSH channel after the terminal has supplied its size."""
+        if self._started or not self._alive:
+            return
+        self._started = True
         threading.Thread(target=self._connect_and_read, daemon=True).start()
 
     def _connect_and_read(self):
@@ -420,7 +453,10 @@ class SshBackend(TerminalBackend):
             except (OSError, AttributeError):
                 pass
             self.client = client
-            self.channel = client.invoke_shell(term="xterm-256color", width=100, height=30)
+            width, height = self._pty_size
+            self.channel = client.invoke_shell(
+                term="xterm-256color", width=width, height=height
+            )
             self.channel.settimeout(0.25)
             # Authentication and transport are ready now. File-browser work
             # can begin without waiting for shell startup/profile output.
@@ -475,9 +511,10 @@ class SshBackend(TerminalBackend):
                 self.error.emit(str(exc))
 
     def resize(self, cols, rows):
+        self._pty_size = (max(20, int(cols)), max(5, int(rows)))
         if self.channel and not self.channel.closed:
             try:
-                self.channel.resize_pty(width=cols, height=rows)
+                self.channel.resize_pty(width=self._pty_size[0], height=self._pty_size[1])
             except Exception:
                 pass
 
@@ -739,6 +776,7 @@ class TerminalWidget(QPlainTextEdit):
     READLINE_REPOSITION_RE = re.compile(
         r"^(?P<up>(?:\x1b\[(?:\d+)?A)+)\r(?P<right>(?:\x1b\[(?:\d+)?C)+)"
     )
+    READLINE_SAME_ROW_RE = re.compile(r"^\r(?P<right>(?:\x1b\[(?:\d+)?C)+)")
     SEMANTIC_TOKEN_RE = re.compile(
         r"(https?://\S+|(?:[A-Za-z]:\\|/)[^\s'\"<>|]+|"
         r"--?[A-Za-z][\w-]*|\b(?:error|failed|failure|fatal|denied)\b|"
@@ -798,6 +836,13 @@ class TerminalWidget(QPlainTextEdit):
         self._rendered_rows = None
         self._requires_full_document_rebuild = False
         self._redraw_control_tail = ""
+        # pyte models DCH per physical row, while readline uses it to redraw
+        # wrapped logical input. Keep any compatibility correction out of the
+        # emulator and apply it only to a copied render snapshot.
+        self._readline_overlay = {}
+        self._active_readline_overlay_keys = set()
+        self._pending_readline_prompt = None
+        self._virtual_readline_prompt = None
         self._last_bell_time = 0.0
         self._cursor_on = True
         self._cursor_timer = QTimer(self)
@@ -964,6 +1009,7 @@ class TerminalWidget(QPlainTextEdit):
             self._rendered_rows = None
             self._history_offset = 0
             self._history_scrolled = False
+            self._clear_readline_overlay()
         finally:
             self._rebuilding_screen = False
 
@@ -989,6 +1035,32 @@ class TerminalWidget(QPlainTextEdit):
             except Exception:
                 result.append({})
         return result
+
+    def _clear_readline_overlay(self):
+        self._readline_overlay = {}
+        self._active_readline_overlay_keys = set()
+        self._pending_readline_prompt = None
+        self._virtual_readline_prompt = None
+
+    def _discard_active_readline_overlay(self):
+        """Remove corrections for the editable command Bash is replacing."""
+        for key in self._active_readline_overlay_keys:
+            self._readline_overlay.pop(key, None)
+        self._active_readline_overlay_keys.clear()
+
+    def _apply_readline_overlay(self, visible_lines):
+        """Apply readline's wrapped-redraw correction to copied screen cells.
+
+        This deliberately never writes to ``screen.buffer`` or its history.
+        Changing pyte's state made old scrollback appear to lose rows when a
+        history entry was redrawn several times.
+        """
+        if not self._readline_overlay:
+            return visible_lines
+        for (row, x), cell in self._readline_overlay.items():
+            if 0 <= row < len(visible_lines) and 0 <= x < self.screen.columns:
+                visible_lines[row][x] = cell
+        return visible_lines
 
     def _scroll_position_changed(self, value):
         """Track whether Qt is showing history or the live terminal bottom."""
@@ -1044,6 +1116,7 @@ class TerminalWidget(QPlainTextEdit):
         self._replay_chunks.clear()
         self._replay_chars = 0
         self._redraw_control_tail = ""
+        self._clear_readline_overlay()
         self._last_terminal_size = None
         self._last_backend_size = None
         self._backend_geometry_needs_sync = False
@@ -1160,11 +1233,26 @@ class TerminalWidget(QPlainTextEdit):
             except Exception:
                 pass
         redraw_probe = self._redraw_control_tail + text
-        if prompt_snapshot is not None and self.DELETE_CHARACTER_RE.search(redraw_probe):
-            text = self._correct_readline_prompt_row(text)
-            redraw_probe = self._redraw_control_tail + text
+        has_delete = bool(self.DELETE_CHARACTER_RE.search(redraw_probe))
+        redraw_target = self._readline_redraw_target(text, previous_cursor)
+        if prompt_snapshot is not None:
+            # A PTY can split CSI n P across reads. Retain the prompt seen
+            # before the incomplete sequence until its final byte arrives.
+            self._pending_readline_prompt = prompt_snapshot
+        elif not has_delete and "\n" in text:
+            # Normal terminal output establishes real rows again, so an old
+            # editable prompt must not be reused for a later redraw. Existing
+            # tail patches stay at their document rows as the command enters
+            # scrollback.
+            self._pending_readline_prompt = None
+            self._virtual_readline_prompt = None
         self._record_replay(text)
         self.stream.feed(text)
+        if not has_delete and redraw_target is not None:
+            # Keep only the old shortened-tail cells that are outside the new
+            # history entry. Dropping the whole patch creates stale suffixes;
+            # retaining all of it creates gaps through the new command.
+            self._refresh_active_readline_overlay(redraw_target)
         # Readline/PSReadLine compactly redraw history entries using cursor
         # movement followed by erase/delete controls. The logical screen is
         # correct in pyte, but explicitly invalidate Qt's document after these
@@ -1173,8 +1261,17 @@ class TerminalWidget(QPlainTextEdit):
         # and "P". Keep a short tail so destructive redraw controls are
         # recognised even when their bytes arrive in separate callbacks.
         self._requires_full_document_rebuild |= bool(self.REDRAW_ERASE_RE.search(redraw_probe))
-        if self.DELETE_CHARACTER_RE.search(redraw_probe):
-            self._clear_shortened_readline_tail(previous_cursor)
+        if has_delete:
+            self._set_readline_overlay(
+                previous_cursor, text,
+                prompt_snapshot or self._pending_readline_prompt,
+            )
+            self._pending_readline_prompt = None
+        elif "\n" in text and redraw_target is None:
+            # Command output has made the current input part of the terminal
+            # transcript. Keep its display correction, but no longer treat it
+            # as an editable row that a later history redraw can replace.
+            self._active_readline_overlay_keys.clear()
         self._redraw_control_tail = redraw_probe[-32:]
         # Readline redraws are latency-sensitive: Ctrl-R, completion cycling,
         # and cursor movement arrive as control sequences and must be visible
@@ -1193,12 +1290,10 @@ class TerminalWidget(QPlainTextEdit):
 
     def _capture_readline_prompt(self, text, previous_cursor):
         """Save a prompt pyte has placed one row below readline's target."""
-        match = self.READLINE_REPOSITION_RE.match(text)
-        if not match:
+        target = self._readline_redraw_target(text, previous_cursor)
+        if target is None:
             return None
-        up = self._readline_motion_count(match.group("up"), "A")
-        right = self._readline_motion_count(match.group("right"), "C")
-        target_y = int(previous_cursor[1]) - up
+        target_y, right = target
         source_y = target_y + 1
         columns = int(self.screen.columns)
         if not (0 <= target_y < self.screen.lines and 0 <= source_y < self.screen.lines):
@@ -1224,54 +1319,77 @@ class TerminalWidget(QPlainTextEdit):
             return None
         return target_y, source_cells
 
-    def _correct_readline_prompt_row(self, text):
-        """Keep readline's redraw in pyte's existing styled-prompt row."""
+    def _readline_redraw_target(self, text, previous_cursor):
+        """Return readline's intended row and prompt width for a redraw."""
         match = self.READLINE_REPOSITION_RE.match(text)
-        if match is None:
-            return text
-        up = match.group("up")
-        motions = list(re.finditer(r"\x1b\[(\d*)A", up))
-        if not motions:
-            return text
-        last = motions[-1]
-        count = int(last.group(1) or 1)
-        replacement = "" if count == 1 else f"\x1b[{count - 1}A"
-        corrected_up = up[:last.start()] + replacement + up[last.end():]
-        corrected = corrected_up + text[match.end("up"):]
-        return corrected
+        if match is not None:
+            up = self._readline_motion_count(match.group("up"), "A")
+            right = self._readline_motion_count(match.group("right"), "C")
+            return int(previous_cursor[1]) - up, right
+        match = self.READLINE_SAME_ROW_RE.match(text)
+        if match is not None:
+            return int(previous_cursor[1]), self._readline_motion_count(match.group("right"), "C")
+        return None
 
-    def _clear_shortened_readline_tail(self, previous_cursor):
-        """Clear cells left after readline shortens a wrapped input line.
-
-        Bash uses DCH (CSI n P) while replacing one history entry with another.
-        pyte applies DCH to its current physical row, but does not clear the
-        continuation cells of the old wrapped input. A real terminal no longer
-        shows those cells once readline has moved the cursor to the shorter
-        replacement. Clear only the range from the new cursor to the previous
-        input endpoint, preserving all earlier terminal output.
-        """
+    def _set_readline_overlay(self, previous_cursor, text, prompt_snapshot):
+        """Correct a readline redraw without changing pyte's screen state."""
+        self._discard_active_readline_overlay()
         old_x, old_y = previous_cursor
-        new_x = int(self.screen.cursor.x)
-        new_y = int(self.screen.cursor.y)
-        columns = int(self.screen.columns)
-        lines = int(self.screen.lines)
-        old_x = max(0, min(columns, int(old_x)))
-        old_y = max(0, min(lines - 1, int(old_y)))
-        new_x = max(0, min(columns, new_x))
-        new_y = max(0, min(lines - 1, new_y))
-
-        if (new_y, new_x) >= (old_y, old_x):
-            return
-
+        new_x, new_y = self.screen.cursor.x, self.screen.cursor.y
+        columns, lines = int(self.screen.columns), int(self.screen.lines)
+        old_x, new_x = max(0, min(columns, int(old_x))), max(0, min(columns, int(new_x)))
+        old_y, new_y = max(0, min(lines - 1, int(old_y))), max(0, min(lines - 1, int(new_y)))
+        # Store document row numbers, rather than live-screen rows. When the
+        # shell prints a result, the corrected command line may move into
+        # pyte's history; its display-only cleared tail must move with it.
+        history_rows = max(0, len(self._history_snapshot()) - lines)
+        overlay = dict(self._readline_overlay)
+        active_keys = set()
         default_cell = getattr(self.screen, "default_char", None)
-        if default_cell is None:
+        if default_cell is not None and (new_y, new_x) < (old_y, old_x):
+            for y in range(new_y, old_y + 1):
+                start = new_x if y == new_y else 0
+                end = old_x if y == old_y else columns
+                for x in range(start, end):
+                    key = (history_rows + y, x)
+                    overlay[key] = default_cell
+                    active_keys.add(key)
+
+        if prompt_snapshot is None and self._virtual_readline_prompt is not None:
+            target = self._readline_redraw_target(text, previous_cursor)
+            if target is not None:
+                prompt_snapshot = (target[0], self._virtual_readline_prompt[1])
+        if prompt_snapshot is not None:
+            prompt_y, prompt_cells = prompt_snapshot
+            if 0 <= prompt_y < lines:
+                for x, cell in enumerate(prompt_cells[:columns]):
+                    overlay[(history_rows + prompt_y, x)] = cell
+                self._virtual_readline_prompt = (prompt_y, tuple(prompt_cells))
+
+        self._readline_overlay = overlay
+        self._active_readline_overlay_keys = active_keys
+        self._requires_full_document_rebuild = True
+
+    def _refresh_active_readline_overlay(self, redraw_target):
+        """Let a replacement history entry paint over its predecessor's tail."""
+        if not self._active_readline_overlay_keys:
             return
-        for y in range(new_y, old_y + 1):
-            start = new_x if y == new_y else 0
-            end = old_x if y == old_y else columns
-            line = self.screen.buffer[y]
-            for x in range(start, end):
-                line[x] = default_cell
+        start_y, start_x = redraw_target
+        end_y, end_x = int(self.screen.cursor.y), int(self.screen.cursor.x)
+        history_rows = max(0, len(self._history_snapshot()) - int(self.screen.lines))
+        if not (0 <= start_y < self.screen.lines and 0 <= end_y < self.screen.lines):
+            return
+        if (end_y, end_x) < (start_y, start_x):
+            return
+        retained = set()
+        for key in self._active_readline_overlay_keys:
+            row, x = key
+            y = row - history_rows
+            if (y, x) < (start_y, start_x) or (y, x) >= (end_y, end_x):
+                retained.add(key)
+                continue
+            self._readline_overlay.pop(key, None)
+        self._active_readline_overlay_keys = retained
         self._requires_full_document_rebuild = True
 
     @staticmethod
@@ -1367,7 +1485,7 @@ class TerminalWidget(QPlainTextEdit):
         # Unlike a rolling one-page canvas, this gives every displayed line a
         # stable document position, so Qt can preserve a multi-line selection
         # while the user scrolls through it.
-        visible_lines = self._history_snapshot()
+        visible_lines = self._apply_readline_overlay(self._history_snapshot())
 
         self.setUpdatesEnabled(False)
         try:
@@ -3630,9 +3748,11 @@ class DeletionLogDialog(QDialog):
 class MainWindow(QMainWindow):
     remote_stats_ready = Signal(object)
     info_ready = Signal(object)
+    update_check_finished = Signal(object)
 
     def __init__(self, show_early=False):
         super().__init__()
+        self.update_check_finished.connect(self._apply_update_check_result)
         self.setWindowTitle("PowerTerm")
         self.resize(1320, 820)
         if show_early:
@@ -3649,6 +3769,10 @@ class MainWindow(QMainWindow):
         self._delete_preview_jobs = set()
         self._external_cache_root = Path(tempfile.mkdtemp(prefix="powerterm-external-"))
         self._external_edit_sessions = set()
+        self._update_check_in_progress = False
+        self._about_dialog = None
+        self._about_update_label = None
+        self._about_update_button = None
         self.host_store = HostStore()
         self.deletion_log_path = self.host_store.path.with_name("deletions.log")
         self.credential_store = CredentialStore()
@@ -4126,6 +4250,7 @@ class MainWindow(QMainWindow):
         self.action_deletion_log = self._make_action("Deletion Log", self._std_icon(QStyle.StandardPixmap.SP_FileDialogInfoView), self.show_deletion_log, tip="Show files and folders deleted through PowerTerm")
         self.action_side_by_side = self._make_action("Side by Side\nSplit", self._terminal_layout_icon(True), self.toggle_side_by_side, "Ctrl+Alt+Right", "Toggle side-by-side terminal panes")
         self.action_side_by_side.setCheckable(True)
+        self.action_about = self._make_action("About and\nUpdates", self._std_icon(QStyle.StandardPixmap.SP_MessageBoxInformation), self.show_about, tip="Show the PowerTerm version and check GitHub releases")
 
         connection = self.menuBar().addMenu("&Connection")
         connection.addActions([self.action_local, self.action_ssh])
@@ -4159,6 +4284,114 @@ class MainWindow(QMainWindow):
         view.addAction(self.action_commands)
         view.addSeparator()
         view.addAction(self.action_side_by_side)
+
+        help_menu = self.menuBar().addMenu("&Help")
+        help_menu.addAction(self.action_about)
+
+    @staticmethod
+    def _version_key(version):
+        """Return comparable numeric release fields, or None for an unknown tag."""
+        text = str(version or "").strip().lstrip("vV")
+        match = re.match(r"^(\d+(?:\.\d+)*)", text)
+        if match is None:
+            return None
+        return tuple(int(part) for part in match.group(1).split("."))
+
+    @classmethod
+    def _release_is_newer(cls, release_version):
+        latest, current = cls._version_key(release_version), cls._version_key(APP_VERSION)
+        if latest is None or current is None:
+            return False
+        width = max(len(latest), len(current))
+        return latest + (0,) * (width - len(latest)) > current + (0,) * (width - len(current))
+
+    def show_about(self):
+        dialog = QDialog(self)
+        dialog.setWindowTitle("About PowerTerm")
+        dialog.setModal(True)
+        dialog.setMinimumWidth(430)
+        layout = QVBoxLayout(dialog)
+        title = QLabel("PowerTerm")
+        font = title.font()
+        font.setPointSize(font.pointSize() + 5)
+        font.setBold(True)
+        title.setFont(font)
+        layout.addWidget(title)
+        layout.addWidget(QLabel(f"Version {APP_VERSION}"))
+        layout.addWidget(QLabel("PowerTerm is licensed under the GNU General Public License, version 3."))
+
+        update_box = QGroupBox("GitHub releases")
+        updates = QVBoxLayout(update_box)
+        self._about_update_label = QLabel("Checking for updates…")
+        self._about_update_label.setWordWrap(True)
+        updates.addWidget(self._about_update_label)
+        self._about_update_button = QPushButton("Check Again")
+        self._about_update_button.clicked.connect(self.check_for_updates)
+        updates.addWidget(self._about_update_button, 0, Qt.AlignmentFlag.AlignLeft)
+        releases_button = QPushButton("Open GitHub Releases")
+        releases_button.clicked.connect(
+            lambda: QDesktopServices.openUrl(QUrl(GITHUB_RELEASES_URL))
+        )
+        updates.addWidget(releases_button, 0, Qt.AlignmentFlag.AlignLeft)
+        layout.addWidget(update_box)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        buttons.rejected.connect(dialog.reject)
+        buttons.accepted.connect(dialog.accept)
+        layout.addWidget(buttons)
+        self._about_dialog = dialog
+        dialog.finished.connect(self._close_about_dialog)
+        self.check_for_updates()
+        dialog.exec()
+
+    def _close_about_dialog(self, *_args):
+        self._about_dialog = None
+        self._about_update_label = None
+        self._about_update_button = None
+
+    def check_for_updates(self):
+        if self._update_check_in_progress:
+            return
+        self._update_check_in_progress = True
+        if self._about_update_label is not None:
+            self._about_update_label.setText("Checking the latest GitHub release…")
+        if self._about_update_button is not None:
+            self._about_update_button.setEnabled(False)
+        threading.Thread(target=self._fetch_latest_release, daemon=True).start()
+
+    def _fetch_latest_release(self):
+        try:
+            request = Request(
+                GITHUB_LATEST_RELEASE_URL,
+                headers={"Accept": "application/vnd.github+json", "User-Agent": "PowerTerm-update-check"},
+            )
+            with urlopen(request, timeout=5) as response:
+                release = json.load(response)
+            tag = str(release.get("tag_name") or release.get("name") or "").strip()
+            if not tag:
+                raise ValueError("GitHub did not provide a release version.")
+            self.update_check_finished.emit({"release": tag, "url": release.get("html_url", "")})
+        except (OSError, URLError, ValueError, json.JSONDecodeError) as error:
+            self.update_check_finished.emit({"error": str(error) or "The update check failed."})
+
+    def _apply_update_check_result(self, result):
+        self._update_check_in_progress = False
+        if self._about_update_button is not None:
+            self._about_update_button.setEnabled(True)
+        if self._about_update_label is None:
+            return
+        if result.get("error"):
+            self._about_update_label.setText(
+                "Could not check GitHub releases. " + result["error"]
+            )
+            return
+        release = result["release"]
+        if self._release_is_newer(release):
+            self._about_update_label.setText(
+                f"Update available: {release}. Visit GitHub Releases to download it."
+            )
+        else:
+            self._about_update_label.setText(f"You are up to date. Latest GitHub release: {release}.")
 
     def _build_file_toolbars(self):
         """File-specific controls live with the file browser, not in the app ribbon."""
@@ -4256,6 +4489,7 @@ class MainWindow(QMainWindow):
             [action_button(self.action_deletion_log)],
         )
         ribbon.addWidget(self.ribbon_file_activity_group)
+        ribbon.addWidget(group("Help", [action_button(self.action_about)]))
         spacer = QWidget()
         spacer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         ribbon.addWidget(spacer)
@@ -4757,9 +4991,12 @@ class MainWindow(QMainWindow):
         terminal.restart_requested.connect(lambda t=terminal: self.restart_terminal_widget(t))
         terminal.save_output_requested.connect(lambda t=terminal: self.save_terminal_output(t))
         terminal.focus_activated.connect(lambda t=terminal: self._activate_terminal_from_focus(t))
-        terminal.set_backend(backend)
         pane = self._active_session_pane or self.session_tabs
         idx=pane.addTab(terminal,title); pane.setCurrentIndex(idx); self._set_active_session_pane(pane); self.canvas.setCurrentWidget(self.session_splitter)
+        terminal.set_backend(backend)
+        # The tab is now part of its final layout, so an SSH PTY can be
+        # created at the real dimensions instead of the backend's fallback.
+        terminal._apply_terminal_resize()
         self._focus_terminal(terminal)
         return terminal
 
@@ -4778,7 +5015,7 @@ class MainWindow(QMainWindow):
         old_backend = getattr(terminal, "backend", None)
         if profile:
             password = getattr(old_backend, "password", "") if old_backend else ""
-            backend = SshBackend(profile["host"], int(profile.get("port", 22)), profile["username"], password, self)
+            backend = SshBackend(profile["host"], int(profile.get("port", 22)), profile["username"], password, self, autostart=False)
             terminal.mode = "ssh-connecting"
             terminal._connection_restarting = True
             terminal.remote_backend = backend
@@ -4787,6 +5024,8 @@ class MainWindow(QMainWindow):
             backend.shell_ready.connect(lambda t=terminal, b=backend, p=profile: self.ssh_shell_ready(t, b, p))
             backend.error.connect(lambda m, t=terminal: self._ssh_connection_failed(t, m))
             self._show_connection_progress(terminal, profile, restarting=True)
+            terminal._apply_terminal_resize()
+            backend.start()
         else:
             backend = WindowsPtyBackend(
                 self,
@@ -4867,13 +5106,17 @@ class MainWindow(QMainWindow):
         self.start_ssh(profile,dialog.password.text())
 
     def start_ssh(self, profile, password=""):
-        backend=SshBackend(profile["host"],int(profile.get("port",22)),profile["username"],password,self)
+        # The terminal must measure its final viewport before SSH requests a
+        # PTY. Starting at 100x30 and resizing afterwards leaves readline's
+        # wrapped-history bookkeeping out of step in maximized windows.
+        backend=SshBackend(profile["host"],int(profile.get("port",22)),profile["username"],password,self,autostart=False)
         title=profile.get("name") or profile["host"]
         terminal=self._new_terminal_widget("ssh-connecting",title,backend,profile)
         terminal._connection_restarting = False
         backend.connected.connect(lambda t=terminal,b=backend,p=profile: self.ssh_connected(t,b,p))
         backend.shell_ready.connect(lambda t=terminal,b=backend,p=profile: self.ssh_shell_ready(t,b,p))
         backend.error.connect(lambda m,t=terminal: self._ssh_connection_failed(t,m))
+        backend.start()
         self._show_connection_progress(terminal, profile)
         pane = self._pane_for_terminal(terminal)
         self.session_tab_changed(pane.indexOf(terminal), pane)
