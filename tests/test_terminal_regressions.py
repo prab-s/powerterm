@@ -172,7 +172,7 @@ class TerminalRegressionTests(unittest.TestCase):
         finally:
             backend.close()
 
-    def test_terminal_input_contract_for_ctrl_r_and_tab(self):
+    def test_terminal_input_contract_for_ctrl_r_tab_and_readline_editing(self):
         class Backend:
             def __init__(self):
                 self.writes = []
@@ -188,7 +188,19 @@ class TerminalRegressionTests(unittest.TestCase):
 
         self.terminal.keyPressEvent(QKeyEvent(QKeyEvent.Type.KeyPress, Qt.Key.Key_R, Qt.KeyboardModifier.ControlModifier, "r"))
         self.terminal.keyPressEvent(QKeyEvent(QKeyEvent.Type.KeyPress, Qt.Key.Key_Tab, Qt.KeyboardModifier.NoModifier, "\t"))
-        self.assertEqual(backend.writes, ["\x12", "\t"])
+        self.terminal.keyPressEvent(QKeyEvent(QKeyEvent.Type.KeyPress, Qt.Key.Key_B, Qt.KeyboardModifier.AltModifier, "b"))
+        self.terminal.keyPressEvent(QKeyEvent(QKeyEvent.Type.KeyPress, Qt.Key.Key_F, Qt.KeyboardModifier.AltModifier, "f"))
+        self.terminal.keyPressEvent(QKeyEvent(QKeyEvent.Type.KeyPress, Qt.Key.Key_D, Qt.KeyboardModifier.AltModifier, "d"))
+        self.terminal.keyPressEvent(QKeyEvent(QKeyEvent.Type.KeyPress, Qt.Key.Key_Left, Qt.KeyboardModifier.AltModifier, ""))
+        self.terminal.keyPressEvent(QKeyEvent(QKeyEvent.Type.KeyPress, Qt.Key.Key_Right, Qt.KeyboardModifier.AltModifier, ""))
+        self.terminal.keyPressEvent(QKeyEvent(QKeyEvent.Type.KeyPress, Qt.Key.Key_Backspace, Qt.KeyboardModifier.AltModifier, ""))
+        self.terminal.keyPressEvent(QKeyEvent(QKeyEvent.Type.KeyPress, Qt.Key.Key_Slash, Qt.KeyboardModifier.ControlModifier, "/"))
+        self.terminal.keyPressEvent(QKeyEvent(QKeyEvent.Type.KeyPress, Qt.Key.Key_Left, Qt.KeyboardModifier.ControlModifier, ""))
+        self.terminal.keyPressEvent(QKeyEvent(QKeyEvent.Type.KeyPress, Qt.Key.Key_Right, Qt.KeyboardModifier.ControlModifier, ""))
+        self.assertEqual(backend.writes, [
+            "\x12", "\t", "\x1bb", "\x1bf", "\x1bd", "\x1b[1;3D", "\x1b[1;3C", "\x1b\x7f",
+            "\x1f", "\x1b[1;5D", "\x1b[1;5C",
+        ])
 
     def test_closed_session_stops_cursor_and_rejects_input(self):
         class Backend:
@@ -371,6 +383,35 @@ class TerminalRegressionTests(unittest.TestCase):
         split = self.terminal.screen.columns - len(prompt)
         self.assertEqual(rendered[:2], [prompt + first[:split], first[split:]])
         self.assertNotIn("main main", "\n".join(rendered))
+
+    def test_single_character_delete_does_not_punch_holes_in_wrapped_input(self):
+        # A bracketed multiline paste is edited by Readline with repeated
+        # CSI 1 P sequences.  Those are ordinary character deletes, not the
+        # multi-cell history-recall redraws that need our tail repair.
+        self.terminal._rebuild_screen(20, 5)
+        self.feed_now("P> " + "abcdefghijklmnopqrstuvwxyz1234567890")
+        for _ in range(4):
+            self.feed_now("\x1b[D\x1b[1P")
+
+        rows = self.terminal.document().toPlainText().splitlines()[-5:]
+        self.assertEqual(rows[0].rstrip(), "P> abcdefghijklmnopq")
+        self.assertEqual(rows[1].rstrip(), "rstuvwxyz123456")
+        self.assertNotIn(" ", rows[1].rstrip())
+
+    def test_bash_quoted_insert_backspace_keeps_the_command_prefix(self):
+        # Captured from Bash 5 + Readline: Ctrl+V then Backspace displays
+        # ``^?`` via ICH, then removes that two-cell representation with
+        # Backspace Backspace CSI 2 P. This is not a history redraw.
+        self.terminal._rebuild_screen(20, 5)
+        self.feed_now("\x1b[?2004hPROMPT> abcdefg")
+        self.feed_now("\x08" * 7)
+        self.feed_now("\x1b[2@^?")
+        self.feed_now("\x08\x08\x1b[2P")
+
+        self.assertEqual(
+            self.terminal.document().toPlainText().splitlines()[-5][0:15],
+            "PROMPT> abcdefg",
+        )
 
     def test_captured_windows_readline_delete_does_not_retain_wrapped_tail(self):
         # Captured from the maximized Windows terminal. pyte previously left

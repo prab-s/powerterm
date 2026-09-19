@@ -407,6 +407,12 @@ class SshBackend(TerminalBackend):
     # Paramiko channels do not expose a Qt-ready signal. Keep the fallback
     # poll short enough that Bash echo/readline redraws do not feel key-bound.
     ssh_poll_interval = 0.002
+    # Keep terminal traffic out of Qt's event queue until the GUI has time to
+    # consume it.  A busy command can otherwise post thousands of tiny
+    # cross-thread ``data`` signals faster than the event loop can paint the
+    # window, which makes the OS mark the application unresponsive.
+    output_available = Signal()
+    output_queue_limit = 1024 * 1024
 
     def __init__(self, host, port, username, password, parent=None, autostart=True):
         super().__init__(parent)
@@ -420,6 +426,13 @@ class SshBackend(TerminalBackend):
         self._shell_ready = False
         self._started = False
         self._pty_size = (100, 30)
+        self._output_chunks = deque()
+        self._output_chars = 0
+        self._output_notified = False
+        self._output_condition = threading.Condition()
+        self._write_chunks = deque()
+        self._write_condition = threading.Condition()
+        self._writer_started = False
         if autostart:
             self.start()
 
@@ -458,6 +471,7 @@ class SshBackend(TerminalBackend):
                 term="xterm-256color", width=width, height=height
             )
             self.channel.settimeout(0.25)
+            self._start_writer()
             # Authentication and transport are ready now. File-browser work
             # can begin without waiting for shell startup/profile output.
             self.connected.emit()
@@ -471,7 +485,7 @@ class SshBackend(TerminalBackend):
                     data = self.channel.recv(65536)
                     if not data:
                         break
-                    self.data.emit(data.decode("utf-8", errors="replace"))
+                    self._queue_output(data.decode("utf-8", errors="replace"))
                     initial_started = time.monotonic()
                     continue
                 if initial_started is not None and time.monotonic() - initial_started >= 0.06:
@@ -488,7 +502,7 @@ class SshBackend(TerminalBackend):
                     data = self.channel.recv(65536)
                     if not data:
                         break
-                    self.data.emit(data.decode("utf-8", errors="replace"))
+                    self._queue_output(data.decode("utf-8", errors="replace"))
                 except socket.timeout:
                     pass
         except Exception as exc:
@@ -503,12 +517,81 @@ class SshBackend(TerminalBackend):
                 pass
             self.closed.emit()
 
-    def write(self, text):
-        if self.channel and not self.channel.closed:
+    def _queue_output(self, text):
+        """Add reader-thread output without flooding Qt's queued signals.
+
+        Waiting here is intentional: once this bounded buffer is full we stop
+        reading the SSH channel, allowing SSH flow control to slow the remote
+        writer.  That is preferable to consuming unlimited memory or starving
+        the GUI event loop.
+        """
+        if not text:
+            return
+        with self._output_condition:
+            while self._alive and self._output_chars >= self.output_queue_limit:
+                self._output_condition.wait(timeout=0.1)
+            if not self._alive:
+                return
+            self._output_chunks.append(text)
+            self._output_chars += len(text)
+            if not self._output_notified:
+                self._output_notified = True
+                self.output_available.emit()
+
+    def take_output(self, limit=32768):
+        """Return a bounded portion of output; called only on the GUI thread."""
+        limit = max(1, int(limit))
+        parts = []
+        size = 0
+        with self._output_condition:
+            while self._output_chunks and size < limit:
+                chunk = self._output_chunks[0]
+                remaining = limit - size
+                if len(chunk) <= remaining:
+                    parts.append(self._output_chunks.popleft())
+                    size += len(chunk)
+                else:
+                    parts.append(chunk[:remaining])
+                    self._output_chunks[0] = chunk[remaining:]
+                    size += remaining
+            self._output_chars -= size
+            more = bool(self._output_chunks)
+            if not more:
+                self._output_notified = False
+            self._output_condition.notify_all()
+        return "".join(parts), more
+
+    def _start_writer(self):
+        if self._writer_started:
+            return
+        self._writer_started = True
+        threading.Thread(target=self._write_worker, daemon=True).start()
+
+    def _write_worker(self):
+        """Keep Paramiko's potentially blocking sendall off the GUI thread."""
+        while self._alive:
+            with self._write_condition:
+                while self._alive and not self._write_chunks:
+                    self._write_condition.wait(timeout=0.25)
+                if not self._alive:
+                    return
+                text = self._write_chunks.popleft()
             try:
-                self.channel.sendall(text)
+                if self.channel and not self.channel.closed:
+                    self.channel.sendall(text)
             except Exception as exc:
-                self.error.emit(str(exc))
+                if self._alive:
+                    self.error.emit(f"SSH write failed: {exc}")
+                return
+
+    def write(self, text):
+        if not text or not self._alive:
+            return
+        # Keystrokes and paste must never wait for remote channel window
+        # space on the Qt thread.
+        with self._write_condition:
+            self._write_chunks.append(text)
+            self._write_condition.notify()
 
     def resize(self, cols, rows):
         self._pty_size = (max(20, int(cols)), max(5, int(rows)))
@@ -540,6 +623,10 @@ class SshBackend(TerminalBackend):
 
     def close(self):
         self._alive = False
+        with self._output_condition:
+            self._output_condition.notify_all()
+        with self._write_condition:
+            self._write_condition.notify_all()
         try:
             if self.channel:
                 self.channel.close()
@@ -772,7 +859,7 @@ class TerminalWidget(QPlainTextEdit):
     focus_activated = Signal()
     OSC7_RE = re.compile(r"\x1b]7;([^\x07\x1b]*)(?:\x07|\x1b\\)")
     REDRAW_ERASE_RE = re.compile(r"\x1b\[[0-9;?]*[JKPX]")
-    DELETE_CHARACTER_RE = re.compile(r"\x1b\[[0-9;?]*P")
+    DELETE_CHARACTER_RE = re.compile(r"\x1b\[(?P<count>\d*)P")
     READLINE_REPOSITION_RE = re.compile(
         r"^(?P<up>(?:\x1b\[(?:\d+)?A)+)\r(?P<right>(?:\x1b\[(?:\d+)?C)+)"
     )
@@ -811,7 +898,8 @@ class TerminalWidget(QPlainTextEdit):
         self._session_active = False
         self._render_pending = False
         self._input_pending = False
-        self._input_buffer = []
+        self._input_buffer = deque()
+        self._backend_drain_pending = False
         self._history_scrolled = False
         self._history_offset = 0
         self._deferred_output = []
@@ -838,6 +926,7 @@ class TerminalWidget(QPlainTextEdit):
         self._rendered_history_first = None
         self._requires_full_document_rebuild = False
         self._redraw_control_tail = ""
+        self._readline_replacement_pending = False
         # pyte models DCH per physical row, while readline uses it to redraw
         # wrapped logical input. Keep any compatibility correction out of the
         # emulator and apply it only to a copied render snapshot.
@@ -1112,6 +1201,7 @@ class TerminalWidget(QPlainTextEdit):
         self._replay_chunks.clear()
         self._replay_chars = 0
         self._redraw_control_tail = ""
+        self._readline_replacement_pending = False
         self._clear_readline_overlay()
         self._last_terminal_size = None
         self._last_backend_size = None
@@ -1133,11 +1223,37 @@ class TerminalWidget(QPlainTextEdit):
         self._last_backend_size = None
         self._backend_geometry_needs_sync = True
         self._session_active = True
-        backend.data.connect(self.feed)
+        # SSH uses a bounded reader-thread queue rather than posting one Qt
+        # event per packet.  Local PTY backends retain the direct signal path.
+        if hasattr(backend, "take_output") and hasattr(backend, "output_available"):
+            backend.output_available.connect(lambda b=backend: self._drain_backend_output(b))
+        else:
+            backend.data.connect(self.feed)
         backend.error.connect(lambda m: QMessageBox.warning(self, "Terminal", m))
         backend.closed.connect(self._backend_closed)
         self._send_resize()
         self.setFocus()
+
+    def _drain_backend_output(self, backend):
+        """Consume a small SSH output slice, then yield to Qt before more."""
+        self._backend_drain_pending = False
+        if backend is not self.backend:
+            return
+        try:
+            text, more = backend.take_output()
+            if text:
+                self.feed(text)
+            if more and not self._backend_drain_pending:
+                self._backend_drain_pending = True
+                # A non-zero delay gives paint/input/window-manager events a
+                # chance between slices during a large remote build.
+                QTimer.singleShot(8, lambda b=backend: self._drain_backend_output(b))
+        except Exception as exc:
+            # Exceptions raised by a Qt slot otherwise only reach stderr and
+            # can leave the output-notification state stuck.
+            if backend is self.backend:
+                self._backend_drain_pending = False
+                QMessageBox.warning(self, "Terminal", f"Could not process SSH output: {exc}")
 
     def _backend_closed(self):
         if not self._session_active:
@@ -1201,8 +1317,23 @@ class TerminalWidget(QPlainTextEdit):
         self._input_pending = False
         if not self._input_buffer:
             return
-        text = "".join(self._input_buffer)
-        self._input_buffer.clear()
+        # pyte parsing and ANSI inspection are GUI-thread work.  Bound one
+        # turn so a sustained build cannot turn a coalesced input queue into
+        # one giant, equally blocking parse operation.
+        budget = 32768
+        parts = []
+        size = 0
+        while self._input_buffer and size < budget:
+            chunk = self._input_buffer[0]
+            remaining = budget - size
+            if len(chunk) <= remaining:
+                parts.append(self._input_buffer.popleft())
+                size += len(chunk)
+            else:
+                parts.append(chunk[:remaining])
+                self._input_buffer[0] = chunk[remaining:]
+                size += remaining
+        text = "".join(parts)
         previous_cursor = (self.screen.cursor.x, self.screen.cursor.y)
         prompt_snapshot = self._capture_readline_prompt(text, previous_cursor)
         # A local PTY can produce its initial prompt before the debounced Qt
@@ -1231,7 +1362,25 @@ class TerminalWidget(QPlainTextEdit):
             except Exception:
                 pass
         redraw_probe = self._redraw_control_tail + text
-        has_delete = bool(self.DELETE_CHARACTER_RE.search(redraw_probe))
+        delete_matches = tuple(self.DELETE_CHARACTER_RE.finditer(redraw_probe))
+        has_delete = bool(delete_matches)
+        # The pyte tail correction is only for Readline's compact history
+        # replacement redraw: it moves vertically to an older wrapped row,
+        # writes replacement text, then deletes its surplus tail.  Do not
+        # apply it to ordinary editing operations such as quoted-insert then
+        # Backspace (which also legitimately emits CSI 2 P for the visible
+        # ``^?`` pair).
+        if re.search(r"\x1b\[(?:\d+)?A", redraw_probe) and any(
+            char.isprintable() and char not in "\x1b\r\n" for char in text
+        ):
+            self._readline_replacement_pending = True
+        # Readline may use CSI 1 P for an ordinary backspace.  pyte already
+        # models that single-cell deletion correctly.  Our tail-cleanup
+        # compatibility repair is only needed for multi-cell *history*
+        # replacement redraws, identified above.
+        requires_tail_cleanup = self._readline_replacement_pending and any(
+            int(match.group("count") or 1) > 1 for match in delete_matches
+        )
         redraw_target = self._readline_redraw_target(text, previous_cursor)
         if prompt_snapshot is not None:
             # A PTY can split CSI n P across reads. Retain the prompt seen
@@ -1255,12 +1404,14 @@ class TerminalWidget(QPlainTextEdit):
         # recognised even when their bytes arrive in separate callbacks.
         self._requires_full_document_rebuild |= bool(self.REDRAW_ERASE_RE.search(redraw_probe))
         if has_delete:
-            self._clear_shortened_readline_tail(previous_cursor)
+            if requires_tail_cleanup:
+                self._clear_shortened_readline_tail(previous_cursor)
             self._set_readline_overlay(
                 previous_cursor, text,
                 prompt_snapshot or self._pending_readline_prompt,
             )
             self._pending_readline_prompt = None
+            self._readline_replacement_pending = False
         elif "\n" in text and redraw_target is None:
             # Command output has made the current input part of the terminal
             # transcript, so an old prompt snapshot cannot be reused later.
@@ -1281,6 +1432,9 @@ class TerminalWidget(QPlainTextEdit):
             # Coalesce ordinary command output. Rendering every small SSH
             # packet makes a busy terminal monopolise the Qt event loop.
             QTimer.singleShot(16, self.render_screen)
+        if self._input_buffer and not self._input_pending:
+            self._input_pending = True
+            QTimer.singleShot(8, self._process_input_batch)
 
     @staticmethod
     def _readline_motion_count(sequence, direction):
@@ -1726,6 +1880,30 @@ class TerminalWidget(QPlainTextEdit):
             return
         if mods & Qt.KeyboardModifier.ControlModifier and mods & Qt.KeyboardModifier.ShiftModifier and key == Qt.Key.Key_V:
             self.paste_to_terminal(); return
+        # Alt is terminal "Meta": printable Alt chords are encoded as an
+        # Escape prefix for Readline's Meta bindings (M-b, M-f, M-d, M-.,
+        # etc.). Qt otherwise supplies only the plain character text.
+        if mods & Qt.KeyboardModifier.AltModifier and not (mods & Qt.KeyboardModifier.ControlModifier):
+            meta_navigation = {
+                Qt.Key.Key_Left: "\x1b[1;3D", Qt.Key.Key_Right: "\x1b[1;3C",
+                Qt.Key.Key_Up: "\x1b[1;3A", Qt.Key.Key_Down: "\x1b[1;3B",
+                Qt.Key.Key_Home: "\x1b[1;3H", Qt.Key.Key_End: "\x1b[1;3F",
+                Qt.Key.Key_Delete: "\x1b[3;3~", Qt.Key.Key_Backspace: "\x1b\x7f",
+            }
+            if key in meta_navigation:
+                self.backend.write(meta_navigation[key]); return
+            meta_text = event.text()
+            if len(meta_text) == 1:
+                self.backend.write("\x1b" + meta_text); return
+        # Ctrl+_ is Readline's undo binding. Depending on keyboard layout Qt
+        # reports that chord as either Slash or Underscore.
+        if mods & Qt.KeyboardModifier.ControlModifier and key in (Qt.Key.Key_Slash, Qt.Key.Key_Underscore):
+            self.backend.write("\x1f"); return
+        # Send the widely supported modified-arrow sequences. Bash/Readline
+        # maps these to backward-word/forward-word; terminals that do not
+        # have those bindings still retain Alt+B/Alt+F above.
+        if mods & Qt.KeyboardModifier.ControlModifier and key in (Qt.Key.Key_Left, Qt.Key.Key_Right):
+            self.backend.write("\x1b[1;5D" if key == Qt.Key.Key_Left else "\x1b[1;5C"); return
         special = {
             Qt.Key.Key_Return: "\r", Qt.Key.Key_Enter: "\r", Qt.Key.Key_Backspace: "\x7f",
             Qt.Key.Key_Tab: "\t", Qt.Key.Key_Backtab: "\t",
@@ -1828,6 +2006,7 @@ class TerminalWidget(QPlainTextEdit):
             self._session_active = False
             self._cursor_timer.stop()
             self.backend.close(); self.backend = None
+            self._backend_drain_pending = False
             self._last_backend_size = None
             self._backend_geometry_needs_sync = False
 
